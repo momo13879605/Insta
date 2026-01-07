@@ -1,966 +1,1398 @@
 import os
-import sys
-import json
+import sqlite3
 import asyncio
-import logging
+import aiohttp
+import aiofiles
+import requests
+import re
 from datetime import datetime
-from pathlib import Path
-from typing import Optional, List, Dict
-import tempfile
+from urllib.parse import urlparse
+from typing import Dict, List, Optional, Tuple, Set
+import json
+import random
+from fake_useragent import UserAgent
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+import string
+import time
 
-# کتابخانه‌های اینستاگرام
-from instagrapi import Client
-from instagrapi.exceptions import (
-    ClientError, LoginRequired, ChallengeRequired,
-    FeedbackRequired, MediaNotFound, UserNotFound
-)
+# ============================
+# تنظیمات اولیه
+# ============================
+TOKEN = '7880725906:AAFOl9it7XDtUY6-phnTc90tXq2rqFcME8M'
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+ADMINS = [5914346958]  # جایگزین کنید با user_id ادمین‌ها
+MAX_WORKERS = 500  # حداکثر Thread همزمان
+REQUEST_TIMEOUT = 15  # زمان تایم‌اوت درخواست‌ها
+PROXY_SOURCES_TIMEOUT = 10  # تایم‌اوت برای دریافت پروکسی‌ها
 
-# کتابخانه‌های تلگرام
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message, FSInputFile, InputMediaPhoto, InputMediaVideo,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+# URLهای API تلگرام
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# تنظیمات لاگ
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# لیست منابع پروکسی (شامل منابع اضافه شده)
+PROXY_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/http.txt",
+    "https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/free.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=ipport&format=text&timeout=20000",
+    "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "https://www.proxy-list.download/api/v1/get?type=http",
+    "https://www.proxy-list.download/api/v1/get?type=https",
+    "https://www.proxy-list.download/api/v1/get?type=socks4",
+    "https://www.proxy-list.download/api/v1/get?type=socks5",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://api.openproxylist.xyz/http.txt",
+    "https://api.openproxylist.xyz/socks4.txt",
+    "https://api.openproxylist.xyz/socks5.txt",
+    "https://proxyspace.pro/http.txt",
+    "https://proxyspace.pro/https.txt",
+    "https://proxyspace.pro/socks4.txt",
+    "https://proxyspace.pro/socks5.txt",
+    "http://worm.rip/http.txt",
+    "http://worm.rip/socks4.txt",
+    "http://worm.rip/socks5.txt"
+]
 
-# توکن ربات تلگرام - اینجا قرار بده
-BOT_TOKEN = "7413084969:AAHglr2N6eO_9VxhGCepns0iWKr9nYgmDZg"
+# ============================
+# دیتابیس SQLite
+# ============================
+def init_db():
+    """ایجاد یا اتصال به دیتابیس SQLite با جداول پیشرفته"""
+    conn = sqlite3.connect('bot_stats.db')
+    cursor = conn.cursor()
+    
+    # جدول آمار کلی
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY,
+            total_users INTEGER DEFAULT 0,
+            total_proxies_processed INTEGER DEFAULT 0,
+            total_proxies_deleted INTEGER DEFAULT 0,
+            total_views_sent INTEGER DEFAULT 0,
+            total_orders INTEGER DEFAULT 0,
+            last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # جدول کاربران
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            total_proxies_uploaded INTEGER DEFAULT 0,
+            total_views_sent INTEGER DEFAULT 0,
+            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # جدول سفارشات
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            channel TEXT,
+            post_id TEXT,
+            proxy_count INTEGER,
+            views_sent INTEGER,
+            status TEXT DEFAULT 'pending',
+            start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            end_time TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users (user_id)
+        )
+    ''')
+    
+    # جدول پروکسی‌ها
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS proxies (
+            proxy_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proxy_address TEXT UNIQUE,
+            proxy_type TEXT,
+            country TEXT,
+            speed REAL,
+            last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active INTEGER DEFAULT 1
+        )
+    ''')
+    
+    # جدول منابع پروکسی
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS proxy_sources (
+            source_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_url TEXT UNIQUE,
+            last_fetch TIMESTAMP,
+            success_count INTEGER DEFAULT 0,
+            fail_count INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # ایجاد رکورد اولیه در stats اگر وجود نداشت
+    cursor.execute('INSERT OR IGNORE INTO stats (id) VALUES (1)')
+    
+    conn.commit()
+    conn.close()
 
-# حالت‌های ربات
-class LoginStates(StatesGroup):
-    waiting_for_username = State()
-    waiting_for_password = State()
-    waiting_for_2fa = State()
-    waiting_for_challenge = State()
-    logged_in = State()
+# ============================
+# توابع دیتابیس (اصلاح SQL Injection)
+# ============================
+def add_user(user_id, username="", first_name="", last_name=""):
+    """افزودن کاربر جدید به دیتابیس"""
+    conn = sqlite3.connect('bot_stats.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT OR IGNORE INTO users 
+        (user_id, username, first_name, last_name) 
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, username, first_name, last_name))
+    cursor.execute('UPDATE stats SET total_users = (SELECT COUNT(*) FROM users) WHERE id = 1')
+    conn.commit()
+    conn.close()
 
-class UserSelectionStates(StatesGroup):
-    waiting_for_username = State()
-    waiting_for_action = State()
-    waiting_for_post_count = State()
+def increment_stats(field, value=1):
+    """افزایش آمار کلی - با امنیت در برابر SQL Injection"""
+    # لیست فیلدهای مجاز
+    allowed_fields = {
+        'total_users',
+        'total_proxies_processed', 
+        'total_proxies_deleted',
+        'total_views_sent',
+        'total_orders'
+    }
+    
+    if field not in allowed_fields:
+        raise ValueError(f"فیلد غیرمجاز: {field}")
+    
+    conn = sqlite3.connect('bot_stats.db')
+    cursor = conn.cursor()
+    cursor.execute(f'UPDATE stats SET {field} = {field} + ? WHERE id = 1', (value,))
+    conn.commit()
+    conn.close()
 
-# کلاس مدیریت اینستاگرام
-class InstagramManager:
+def add_order(user_id, channel, post_id, proxy_count):
+    """افزودن سفارش جدید"""
+    conn = sqlite3.connect('bot_stats.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO orders (user_id, channel, post_id, proxy_count)
+        VALUES (?, ?, ?, ?)
+    ''', (user_id, channel, post_id, proxy_count))
+    order_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    increment_stats('total_orders')
+    return order_id
+
+def update_order(order_id, views_sent, status='completed'):
+    """به‌روزرسانی سفارش"""
+    conn = sqlite3.connect('bot_stats.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE orders 
+        SET views_sent = ?, status = ?, end_time = CURRENT_TIMESTAMP
+        WHERE order_id = ?
+    ''', (views_sent, status, order_id))
+    conn.commit()
+    conn.close()
+
+def get_stats():
+    """دریافت آمار کامل"""
+    conn = sqlite3.connect('bot_stats.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT 
+            total_users,
+            total_proxies_processed,
+            total_proxies_deleted,
+            total_views_sent,
+            total_orders,
+            last_activity
+        FROM stats WHERE id = 1
+    ''')
+    stats = cursor.fetchone()
+    
+    # آمار سفارشات امروز
+    cursor.execute('''
+        SELECT COUNT(*) FROM orders 
+        WHERE DATE(start_time) = DATE('now')
+    ''')
+    today_orders = cursor.fetchone()[0]
+    
+    conn.close()
+    return stats, today_orders
+
+# ============================
+# کلاس دریافت پروکسی از منابع آنلاین با گزارش پیشرفت
+# ============================
+class OnlineProxyFetcher:
     def __init__(self):
-        self.script_dir = Path(__file__).resolve().parent
-        self.session_dir = self.script_dir / "sessions"
-        self.download_dir = self.script_dir / "downloads"
+        self.ua = UserAgent()
+        self.all_proxies = set()
+        self.verified_proxies = []
+        self.session = None
+        self.current_progress = 0
+        self.current_stage = ""
         
-        # ساخت پوشه‌ها
-        self.session_dir.mkdir(exist_ok=True)
-        self.download_dir.mkdir(exist_ok=True)
+    async def initialize_session(self):
+        """ایجاد session ناهمزمان"""
+        if not self.session:
+            self.session = aiohttp.ClientSession(
+                headers={'User-Agent': self.ua.random},
+                timeout=aiohttp.ClientTimeout(total=PROXY_SOURCES_TIMEOUT)
+            )
+    
+    async def close_session(self):
+        """بستن session"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+    
+    async def fetch_from_source(self, source_url):
+        """دریافت پروکسی‌ها از یک منبع"""
+        try:
+            if not self.session:
+                await self.initialize_session()
+            
+            async with self.session.get(source_url, ssl=False) as response:
+                if response.status == 200:
+                    text = await response.text()
+                    # استخراج پروکسی‌ها با الگوهای مختلف
+                    proxies = set()
+                    
+                    # الگوهای مختلف پروکسی
+                    patterns = [
+                        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5}',  # IP:Port
+                        r'http[s]?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5}',  # http://IP:Port
+                        r'socks[4-5]?://\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5}',  # socks://IP:Port
+                        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5}:\w+:\w+',  # IP:Port:User:Pass
+                        r'http[s]?://\w+:\w+@\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d{2,5}',  # http://user:pass@IP:Port
+                    ]
+                    
+                    for pattern in patterns:
+                        found = re.findall(pattern, text)
+                        proxies.update(found)
+                    
+                    return list(proxies), len(proxies)
+                    
+        except Exception as e:
+            print(f"❌ خطا در دریافت از {source_url}: {e}")
         
-        self.clients = {}  # {user_id: Client}
-        self.user_data = {}  # {user_id: {username: "", target_user: ""}}
-
-    async def login_user(self, user_id: int, username: str, password: str) -> tuple[bool, str, Optional[str]]:
-        """لاگین کاربر و ذخیره سشن"""
-        try:
-            # ایجاد کلاینت جدید
-            cl = Client()
-            cl.delay_range = [2, 5]
-            
-            # مسیر سشن
-            session_file = self.session_dir / f"{user_id}_{username}.json"
-            
-            # تلاش برای بارگذاری سشن قبلی
-            if session_file.exists():
-                try:
-                    cl.load_settings(str(session_file))
-                    await cl.get_timeline_feed()
-                    self.clients[user_id] = cl
-                    self.user_data[user_id] = {"username": username, "target_user": ""}
-                    return True, f"✅ با موفقیت با سشن ذخیره شده وارد شدید. (@{username})", None
-                except Exception as e:
-                    logger.warning(f"Session expired: {e}")
-                    if session_file.exists():
-                        session_file.unlink()
-            
-            # لاگین جدید
-            login_result = cl.login(username, password)
-            
-            # بررسی 2FA
-            if cl.settings.get("2fa_enabled"):
-                self.clients[user_id] = cl
-                self.user_data[user_id] = {"username": username, "target_user": ""}
-                return False, "🔑 احراز هویت دو مرحله‌ای فعال است. لطفا کد را وارد کنید:", "2fa"
-            
-            # ذخیره سشن
-            cl.dump_settings(str(session_file))
-            self.clients[user_id] = cl
-            self.user_data[user_id] = {"username": username, "target_user": ""}
-            return True, f"✅ لاگین موفقیت‌آمیز! خوش آمدید @{username}", None
-            
-        except ChallengeRequired:
-            self.clients[user_id] = Client()
-            self.user_data[user_id] = {"username": username, "target_user": ""}
-            return False, "🛡️ چالش امنیتی اینستاگرام. لطفا کد ارسال شده را وارد کنید:", "challenge"
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return False, f"❌ خطا در لاگین: {str(e)}", None
+        return [], 0
     
-    async def handle_2fa(self, user_id: int, code: str) -> tuple[bool, str]:
-        """مدیریت احراز هویت دو مرحله‌ای"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ سشن یافت نشد. لطفا دوباره لاگین کنید."
+    async def fetch_all_sources(self, update_progress_callback=None):
+        """دریافت پروکسی‌ها از تمام منابع با گزارش پیشرفت"""
+        total_sources = len(PROXY_SOURCES)
+        current_source = 0
+        total_found = 0
+        
+        # مرحله 1: شروع دریافت
+        if update_progress_callback:
+            await update_progress_callback(
+                stage="دریافت از منابع",
+                progress=0,
+                current=0,
+                total=total_sources,
+                found=0
+            )
+        
+        tasks = []
+        
+        # ایجاد تسک‌ها برای تمام منابع
+        for source in PROXY_SOURCES:
+            tasks.append(self.fetch_from_source(source))
+        
+        # اجرای همزمان تمام تسک‌ها
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # پردازش نتایج
+        for i, result in enumerate(results):
+            current_source += 1
+            progress_percent = int((current_source / total_sources) * 100)
             
-            cl.two_factor_login(code)
-            # ذخیره سشن
-            username = self.user_data[user_id]["username"]
-            session_file = self.session_dir / f"{user_id}_{username}.json"
-            cl.dump_settings(str(session_file))
-            return True, f"✅ 2FA تایید شد! لاگین کامل شد."
+            if isinstance(result, Exception):
+                print(f"❌ خطا در منبع {PROXY_SOURCES[i].split('/')[2]}: {result}")
+            else:
+                proxies, count = result
+                if proxies:
+                    self.all_proxies.update(proxies)
+                    total_found += count
             
-        except Exception as e:
-            logger.error(f"2FA error: {e}")
-            return False, f"❌ خطا در تایید 2FA: {str(e)}"
+            # آپدیت پیشرفت
+            if update_progress_callback:
+                await update_progress_callback(
+                    stage="دریافت از منابع",
+                    progress=progress_percent,
+                    current=current_source,
+                    total=total_sources,
+                    found=len(self.all_proxies)
+                )
+            
+            await asyncio.sleep(0.1)  # وقفه کوتاه
+        
+        return list(self.all_proxies)
     
-    async def handle_challenge(self, user_id: int, code: str) -> tuple[bool, str]:
-        """مدیریت چالش امنیتی"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ سشن یافت نشد. لطفا دوباره لاگین کنید."
-            
-            cl.challenge_resolve(code)
-            # ذخیره سشن
-            username = self.user_data[user_id]["username"]
-            session_file = self.session_dir / f"{user_id}_{username}.json"
-            cl.dump_settings(str(session_file))
-            return True, f"✅ چالش حل شد! لاگین کامل شد."
-            
-        except Exception as e:
-            logger.error(f"Challenge error: {e}")
-            return False, f"❌ خطا در حل چالش: {str(e)}"
+    def normalize_proxy(self, proxy_line):
+        """نرمال‌سازی پروکسی به فرمت استاندارد"""
+        proxy_line = proxy_line.strip()
+        if not proxy_line:
+            return None
+        
+        # اگر پروکسی بدون پروتکل بود، پروتکل http اضافه کن
+        if '://' not in proxy_line:
+            # بررسی فرمت user:pass@host:port
+            if '@' in proxy_line:
+                return f"http://{proxy_line}"
+            # بررسی فرمت host:port:user:pass
+            elif proxy_line.count(':') == 3:
+                parts = proxy_line.split(':')
+                if len(parts) == 4:
+                    host, port, user, pwd = parts
+                    return f"http://{user}:{pwd}@{host}:{port}"
+            # فرمت ساده host:port
+            elif ':' in proxy_line:
+                return f"http://{proxy_line}"
+        
+        return proxy_line
     
-    async def get_user_info(self, user_id: int, target_username: str) -> tuple[bool, str, Optional[Dict]]:
-        """دریافت اطلاعات کاربر"""
+    async def verify_proxy_async(self, proxy_url):
+        """تأیید پروکسی به صورت ناهمزمان"""
         try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ ابتدا باید لاگین کنید.", None
+            # نرمال‌سازی پروکسی
+            normalized_proxy = self.normalize_proxy(proxy_url)
+            if not normalized_proxy:
+                return None
             
-            target_user_id = cl.user_id_from_username(target_username)
-            user_info = cl.user_info(target_user_id)
+            # تشخیص نوع پروکسی
+            if 'socks5://' in normalized_proxy:
+                proxy_type = 'socks5'
+            elif 'socks4://' in normalized_proxy:
+                proxy_type = 'socks4'
+            elif 'https://' in normalized_proxy:
+                proxy_type = 'https'
+            else:
+                proxy_type = 'http'
             
-            info = {
-                "username": user_info.username,
-                "full_name": user_info.full_name,
-                "bio": user_info.biography,
-                "followers": user_info.follower_count,
-                "following": user_info.following_count,
-                "posts": user_info.media_count,
-                "is_private": user_info.is_private,
-                "is_verified": user_info.is_verified,
-                "profile_pic_url": user_info.profile_pic_url_hd
+            # تست پروکسی
+            connector = aiohttp.TCPConnector(ssl=False)
+            
+            async with aiohttp.ClientSession(
+                connector=connector,
+                headers={'User-Agent': self.ua.random}
+            ) as session:
+                
+                # تنظیم پروکسی
+                session.proxy = normalized_proxy
+                
+                # ارسال درخواست تست
+                async with session.get(
+                    'http://httpbin.org/ip',
+                    timeout=aiohttp.ClientTimeout(total=5)
+                ) as response:
+                    
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'origin' in data:
+                            return {
+                                'url': normalized_proxy,
+                                'type': proxy_type,
+                                'working': True
+                            }
+        
+        except Exception as e:
+            pass
+        
+        return None
+    
+    async def verify_proxies_batch(self, proxies, update_progress_callback=None, batch_size=50):
+        """تأیید دسته‌ای پروکسی‌ها با گزارش پیشرفت"""
+        verified_proxies = []
+        total = len(proxies)
+        processed = 0
+        last_update_time = 0
+        
+        # مرحله 2: شروع تأیید
+        if update_progress_callback:
+            await update_progress_callback(
+                stage="تأیید سلامت پروکسی‌ها",
+                progress=0,
+                current=0,
+                total=total,
+                verified=0
+            )
+        
+        # پردازش دسته‌ای
+        for i in range(0, total, batch_size):
+            batch = proxies[i:i+batch_size]
+            tasks = []
+            
+            for proxy in batch:
+                tasks.append(self.verify_proxy_async(proxy))
+            
+            # اجرای همزمان
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # پردازش نتایج
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                if result and result['working']:
+                    verified_proxies.append(result)
+            
+            processed += len(batch)
+            progress = int((processed / total) * 100)
+            
+            # آپدیت پیشرفت (هر 5 درصد یا هر 5 ثانیه)
+            current_time = time.time()
+            if update_progress_callback and (progress % 5 == 0 or current_time - last_update_time > 5):
+                last_update_time = current_time
+                await update_progress_callback(
+                    stage="تأیید سلامت پروکسی‌ها",
+                    progress=progress,
+                    current=processed,
+                    total=total,
+                    verified=len(verified_proxies)
+                )
+            
+            await asyncio.sleep(0.5)  # وقفه برای جلوگیری از overload
+        
+        # مرحله 3: تکمیل تأیید
+        if update_progress_callback:
+            await update_progress_callback(
+                stage="تأیید سلامت پروکسی‌ها",
+                progress=100,
+                current=total,
+                total=total,
+                verified=len(verified_proxies)
+            )
+        
+        return verified_proxies
+    
+    def classify_proxy(self, proxy_url):
+        """طبقه‌بندی پروکسی بر اساس ISP"""
+        proxy_lower = proxy_url.lower()
+        
+        # تشخیص کشور/ISP بر اساس IP یا domain
+        iran_keywords = ['ir', 'iran', 'mci', 'mtn', 'rightel', 'tci']
+        for keyword in iran_keywords:
+            if keyword in proxy_lower:
+                return 'iran'
+        
+        # تشخیص تلگرام
+        if 'telegram' in proxy_lower or 't.me' in proxy_lower or 'tg' in proxy_lower:
+            return 'telegram'
+        
+        # تشخیص نوع پروکسی
+        if 'socks5' in proxy_lower:
+            return 'socks5'
+        elif 'socks4' in proxy_lower:
+            return 'socks4'
+        elif 'https' in proxy_lower:
+            return 'https'
+        
+        return 'http'
+    
+    async def fetch_and_verify_proxies(self, update_progress_callback=None, max_proxies=1000):
+        """دریافت و تأیید پروکسی‌ها با گزارش پیشرفت کامل"""
+        try:
+            # مرحله 1: دریافت پروکسی‌ها از منابع
+            all_proxies = await self.fetch_all_sources(update_progress_callback)
+            
+            if not all_proxies:
+                if update_progress_callback:
+                    await update_progress_callback(
+                        stage="خطا",
+                        progress=0,
+                        current=0,
+                        total=0,
+                        found=0,
+                        error="هیچ پروکسی یافت نشد!"
+                    )
+                return {}
+            
+            # مرحله 2: تأیید پروکسی‌ها
+            verified = await self.verify_proxies_batch(
+                all_proxies[:max_proxies*2],
+                update_progress_callback
+            )
+            
+            # مرحله 3: دسته‌بندی پروکسی‌ها
+            categorized_proxies = {
+                'http': [], 'https': [], 'socks4': [], 'socks5': [],
+                'iran': [], 'telegram': [], 'all': []
             }
             
-            return True, "✅ اطلاعات کاربر دریافت شد.", info
-            
-        except UserNotFound:
-            return False, f"❌ کاربر @{target_username} یافت نشد.", None
-        except Exception as e:
-            logger.error(f"Get user info error: {e}")
-            return False, f"❌ خطا: {str(e)}", None
-    
-    async def download_profile_pic(self, user_id: int, target_username: str) -> tuple[bool, str, List[str]]:
-        """دانلود عکس پروفایل"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ ابتدا باید لاگین کنید.", []
-            
-            target_user_id = cl.user_id_from_username(target_username)
-            user_info = cl.user_info(target_user_id)
-            
-            # ایجاد پوشه موقت
-            temp_dir = Path(tempfile.mkdtemp())
-            file_path = temp_dir / f"{target_username}_profile.jpg"
-            
-            # دانلود عکس پروفایل
-            response = cl.http.get(user_info.profile_pic_url_hd)
-            if response.status_code == 200:
-                with open(file_path, 'wb') as f:
-                    f.write(response.content)
+            for proxy_info in verified[:max_proxies]:
+                proxy_type = proxy_info['type']
+                proxy_url = proxy_info['url']
                 
-                caption = f"👤 پروفایل: @{target_username}\n"
-                caption += f"📛 نام: {user_info.full_name}\n"
-                caption += f"👥 فالوور: {user_info.follower_count:,}\n"
-                if user_info.biography:
-                    caption += f"📝 بیو: {user_info.biography}"
+                # اضافه به دسته نوع پروکسی
+                if proxy_type in categorized_proxies:
+                    categorized_proxies[proxy_type].append(proxy_url)
                 
-                return True, caption, [str(file_path)]
-            else:
-                return False, "❌ خطا در دانلود عکس پروفایل.", []
+                # اضافه به دسته ISP/کشور
+                isp_type = self.classify_proxy(proxy_url)
+                if isp_type in categorized_proxies:
+                    categorized_proxies[isp_type].append(proxy_url)
                 
-        except Exception as e:
-            logger.error(f"Download profile pic error: {e}")
-            return False, f"❌ خطا: {str(e)}", []
-    
-    async def download_stories(self, user_id: int, target_username: str) -> tuple[bool, str, List[str]]:
-        """دانلود استوری‌های کاربر"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ ابتدا باید لاگین کنید.", []
+                # اضافه به لیست همه
+                categorized_proxies['all'].append(proxy_url)
             
-            target_user_id = cl.user_id_from_username(target_username)
-            stories = cl.user_stories(target_user_id)
+            # مرحله 4: ذخیره در فایل با aiofiles (غیرمسدودکننده)
+            await self.save_categorized_proxies(categorized_proxies)
             
-            if not stories:
-                return False, f"❌ استوری فعالی برای @{target_username} یافت نشد.", []
+            # مرحله 5: تکمیل
+            if update_progress_callback:
+                await update_progress_callback(
+                    stage="تکمیل",
+                    progress=100,
+                    current=len(verified),
+                    total=len(verified),
+                    verified=len(verified),
+                    categorized=len(categorized_proxies['all'])
+                )
             
-            # ایجاد پوشه موقت
-            temp_dir = Path(tempfile.mkdtemp())
-            file_paths = []
-            
-            with open(temp_dir / "info.txt", "w", encoding="utf-8") as f:
-                f.write(f"استوری‌های @{target_username}\n")
-                f.write(f"تاریخ دانلود: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"تعداد استوری: {len(stories)}\n")
-                f.write("="*50 + "\n")
-                
-                for i, story in enumerate(stories):
-                    try:
-                        if story.media_type == 2:  # ویدیو
-                            path = cl.video_download(story.pk, folder=str(temp_dir))
-                        else:  # عکس
-                            path = cl.photo_download(story.pk, folder=str(temp_dir))
-                        
-                        if path:
-                            file_paths.append(path)
-                            f.write(f"استوری {i+1}: {os.path.basename(path)}\n")
-                            f.write(f"تاریخ: {story.taken_at}\n")
-                            f.write(f"نوع: {'ویدیو' if story.media_type == 2 else 'عکس'}\n")
-                            f.write("-"*30 + "\n")
-                            
-                    except Exception as e:
-                        logger.error(f"Error downloading story {i}: {e}")
-                        continue
-            
-            caption = f"📖 استوری‌های @{target_username}\n"
-            caption += f"📊 تعداد: {len(file_paths)} از {len(stories)}\n"
-            caption += f"⏰ تاریخ دانلود: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            
-            # اضافه کردن فایل اطلاعات
-            file_paths.append(str(temp_dir / "info.txt"))
-            
-            return True, caption, file_paths
+            return categorized_proxies
             
         except Exception as e:
-            logger.error(f"Download stories error: {e}")
-            return False, f"❌ خطا: {str(e)}", []
+            if update_progress_callback:
+                await update_progress_callback(
+                    stage="خطا",
+                    progress=0,
+                    current=0,
+                    total=0,
+                    error=str(e)
+                )
+            print(f"❌ خطا در دریافت پروکسی‌ها: {e}")
+            return {}
     
-    async def download_highlights(self, user_id: int, target_username: str) -> tuple[bool, str, List[str]]:
-        """دانلود هایلایت‌های کاربر"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ ابتدا باید لاگین کنید.", []
-            
-            target_user_id = cl.user_id_from_username(target_username)
-            highlights = cl.user_highlights(target_user_id)
-            
-            if not highlights:
-                return False, f"❌ هایلایتی برای @{target_username} یافت نشد.", []
-            
-            # ایجاد پوشه موقت
-            temp_dir = Path(tempfile.mkdtemp())
-            file_paths = []
-            total_items = 0
-            
-            with open(temp_dir / "info.txt", "w", encoding="utf-8") as f:
-                f.write(f"هایلایت‌های @{target_username}\n")
-                f.write(f"تاریخ دانلود: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"تعداد هایلایت: {len(highlights)}\n")
-                f.write("="*50 + "\n")
-                
-                for h_idx, highlight in enumerate(highlights):
-                    f.write(f"\nهایلایت {h_idx+1}: {highlight.title}\n")
-                    f.write(f"تعداد آیتم: {len(highlight.items)}\n")
-                    
-                    highlight_folder = temp_dir / f"highlight_{h_idx+1}"
-                    highlight_folder.mkdir(exist_ok=True)
-                    
-                    for i, item in enumerate(highlight.items):
-                        try:
-                            if item.media_type == 2:  # ویدیو
-                                path = cl.video_download(item.pk, folder=str(highlight_folder))
-                            else:  # عکس
-                                path = cl.photo_download(item.pk, folder=str(highlight_folder))
-                            
-                            if path:
-                                file_paths.append(path)
-                                total_items += 1
-                                f.write(f"  آیتم {i+1}: {os.path.basename(path)}\n")
-                                
-                        except Exception as e:
-                            logger.error(f"Error downloading highlight item: {e}")
-                            continue
-            
-            caption = f"🌟 هایلایت‌های @{target_username}\n"
-            caption += f"📊 تعداد هایلایت: {len(highlights)}\n"
-            caption += f"📁 تعداد آیتم: {total_items}\n"
-            caption += f"⏰ تاریخ دانلود: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            
-            # اضافه کردن فایل اطلاعات
-            file_paths.append(str(temp_dir / "info.txt"))
-            
-            return True, caption, file_paths
-            
-        except Exception as e:
-            logger.error(f"Download highlights error: {e}")
-            return False, f"❌ خطا: {str(e)}", []
-    
-    async def download_posts(self, user_id: int, target_username: str, count: int = 12) -> tuple[bool, str, List[str]]:
-        """دانلود پست‌های کاربر"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ ابتدا باید لاگین کنید.", []
-            
-            target_user_id = cl.user_id_from_username(target_username)
-            medias = cl.user_medias(target_user_id, amount=count)
-            
-            if not medias:
-                return False, f"❌ پستی برای @{target_username} یافت نشد.", []
-            
-            # ایجاد پوشه موقت
-            temp_dir = Path(tempfile.mkdtemp())
-            file_paths = []
-            
-            with open(temp_dir / "info.txt", "w", encoding="utf-8") as f:
-                f.write(f"پست‌های @{target_username}\n")
-                f.write(f"تاریخ دانلود: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"تعداد پست: {len(medias)}\n")
-                f.write("="*50 + "\n")
-                
-                for i, media in enumerate(medias):
-                    try:
-                        f.write(f"\nپست {i+1}:\n")
-                        f.write(f"لینک: https://www.instagram.com/p/{media.code}/\n")
-                        f.write(f"تاریخ: {media.taken_at}\n")
-                        f.write(f"لایک: {media.like_count}\n")
-                        f.write(f"کامنت: {media.comment_count}\n")
-                        if media.caption_text:
-                            f.write(f"کپشن: {media.caption_text[:200]}...\n")
-                        
-                        if media.media_type == 8:  # آلبوم
-                            album_folder = temp_dir / f"post_{i+1}"
-                            album_folder.mkdir(exist_ok=True)
-                            
-                            for j, resource in enumerate(media.resources):
-                                if resource.video_url:
-                                    path = cl.video_download(resource.pk, folder=str(album_folder))
-                                else:
-                                    path = cl.photo_download(resource.pk, folder=str(album_folder))
-                                
-                                if path:
-                                    file_paths.append(path)
-                                    f.write(f"  فایل {j+1}: {os.path.basename(path)}\n")
-                            
-                        elif media.media_type == 2:  # ویدیو
-                            path = cl.video_download(media.pk, folder=str(temp_dir))
-                            if path:
-                                file_paths.append(path)
-                                f.write(f"فایل: {os.path.basename(path)}\n")
-                                
-                        else:  # عکس
-                            path = cl.photo_download(media.pk, folder=str(temp_dir))
-                            if path:
-                                file_paths.append(path)
-                                f.write(f"فایل: {os.path.basename(path)}\n")
-                                
-                        f.write("-"*30 + "\n")
-                        
-                    except Exception as e:
-                        logger.error(f"Error downloading post {i}: {e}")
-                        f.write(f"خطا در دانلود: {str(e)}\n")
-                        continue
-            
-            caption = f"📸 پست‌های @{target_username}\n"
-            caption += f"📊 تعداد: {len(file_paths)} فایل از {len(medias)} پست\n"
-            caption += f"⏰ تاریخ دانلود: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-            
-            # اضافه کردن فایل اطلاعات
-            file_paths.append(str(temp_dir / "info.txt"))
-            
-            return True, caption, file_paths
-            
-        except Exception as e:
-            logger.error(f"Download posts error: {e}")
-            return False, f"❌ خطا: {str(e)}", []
-    
-    async def download_followers(self, user_id: int, target_username: str, count: int = 100) -> tuple[bool, str, List[str]]:
-        """دریافت لیست فالوورها"""
-        try:
-            cl = self.clients.get(user_id)
-            if not cl:
-                return False, "❌ ابتدا باید لاگین کنید.", []
-            
-            target_user_id = cl.user_id_from_username(target_username)
-            followers = cl.user_followers(target_user_id, amount=count)
-            
-            if not followers:
-                return False, f"❌ فالووری برای @{target_username} یافت نشد.", []
-            
-            # ایجاد فایل TXT
-            temp_dir = Path(tempfile.mkdtemp())
-            txt_file = temp_dir / f"followers_{target_username}.txt"
-            
-            with open(txt_file, "w", encoding="utf-8") as f:
-                f.write(f"لیست فالوورهای @{target_username}\n")
-                f.write(f"تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"تعداد: {len(followers)}\n")
-                f.write("="*50 + "\n\n")
-                
-                for i, (follower_id, follower_info) in enumerate(followers.items(), 1):
-                    f.write(f"{i}. @{follower_info.username}\n")
-                    f.write(f"   نام: {follower_info.full_name}\n")
-                    f.write(f"   فالوور: {follower_info.follower_count:,}\n")
-                    f.write(f"   فالووینگ: {follower_info.following_count:,}\n")
-                    f.write(f"   پست: {follower_info.media_count}\n")
-                    f.write(f"   خصوصی: {'بله' if follower_info.is_private else 'خیر'}\n")
-                    f.write("-"*30 + "\n")
-            
-            caption = f"👥 فالوورهای @{target_username}\n"
-            caption += f"📊 تعداد: {len(followers)} نفر\n"
-            caption += f"📁 فایل TXT آماده دانلود"
-            
-            return True, caption, [str(txt_file)]
-            
-        except Exception as e:
-            logger.error(f"Download followers error: {e}")
-            return False, f"❌ خطا: {str(e)}", []
-    
-    def cleanup_temp_files(self, file_paths: List[str]):
-        """پاکسازی فایل‌های موقت"""
-        for file_path in file_paths:
-            try:
-                if os.path.exists(file_path):
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                    elif os.path.isdir(file_path):
-                        import shutil
-                        shutil.rmtree(file_path)
-            except Exception as e:
-                logger.error(f"Error cleaning up {file_path}: {e}")
-
-# ایجاد ربات
-router = Router()
-instagram_manager = InstagramManager()
-
-def create_user_menu() -> InlineKeyboardMarkup:
-    """ایجاد منوی انتخاب عملیات برای کاربر"""
-    keyboard = [
-        [InlineKeyboardButton(text="📊 اطلاعات پروفایل", callback_data="action_profile_info")],
-        [InlineKeyboardButton(text="🖼️ عکس پروفایل", callback_data="action_profile_pic")],
-        [InlineKeyboardButton(text="📖 استوری‌ها", callback_data="action_stories")],
-        [InlineKeyboardButton(text="🌟 هایلایت‌ها", callback_data="action_highlights")],
-        [InlineKeyboardButton(text="📸 پست‌ها", callback_data="action_posts")],
-        [InlineKeyboardButton(text="👥 فالوورها", callback_data="action_followers")],
-        [InlineKeyboardButton(text="❌ انصراف", callback_data="action_cancel")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-def create_post_count_menu() -> InlineKeyboardMarkup:
-    """منوی انتخاب تعداد پست"""
-    keyboard = [
-        [InlineKeyboardButton(text="12 پست آخر", callback_data="count_12")],
-        [InlineKeyboardButton(text="24 پست آخر", callback_data="count_24")],
-        [InlineKeyboardButton(text="50 پست آخر", callback_data="count_50")],
-        [InlineKeyboardButton(text="100 پست آخر", callback_data="count_100")],
-        [InlineKeyboardButton(text="❌ انصراف", callback_data="action_cancel")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-def create_follower_count_menu() -> InlineKeyboardMarkup:
-    """منوی انتخاب تعداد فالوور"""
-    keyboard = [
-        [InlineKeyboardButton(text="100 فالوور", callback_data="fcount_100")],
-        [InlineKeyboardButton(text="500 فالوور", callback_data="fcount_500")],
-        [InlineKeyboardButton(text="1000 فالوور", callback_data="fcount_1000")],
-        [InlineKeyboardButton(text="همه فالوورها", callback_data="fcount_all")],
-        [InlineKeyboardButton(text="❌ انصراف", callback_data="action_cancel")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        "👋 خوش آمدید به ربات پیشرفته دانلودر اینستاگرام!\n\n"
-        "✨ <b>ویژگی‌های ربات:</b>\n"
-        "• دانلود استوری‌ها\n"
-        "• دانلود هایلایت‌ها\n"
-        "• دانلود پست‌ها\n"
-        "• دریافت عکس پروفایل\n"
-        "• مشاهده اطلاعات کامل پروفایل\n"
-        "• دریافت لیست فالوورها\n\n"
-        "📋 <b>دستورات:</b>\n"
-        "/login - ورود به حساب اینستاگرام\n"
-        "/download - انتخاب کاربر و عملیات\n"
-        "/logout - خروج از حساب\n"
-        "/status - وضعیت فعلی\n"
-        "/help - راهنمایی کامل\n\n"
-        "⚠️ <i>اطلاعات لاگین شما به صورت امن ذخیره می‌شود.</i>",
-        parse_mode=ParseMode.HTML
-    )
-
-@router.message(Command("login"))
-async def cmd_login(message: Message, state: FSMContext):
-    await state.set_state(LoginStates.waiting_for_username)
-    await message.answer("📝 لطفا <b>نام کاربری اینستاگرام</b> خود را وارد کنید:", parse_mode=ParseMode.HTML)
-
-@router.message(LoginStates.waiting_for_username)
-async def process_username(message: Message, state: FSMContext):
-    await state.update_data(username=message.text.strip())
-    await state.set_state(LoginStates.waiting_for_password)
-    await message.answer("🔑 لطفا <b>رمز عبور</b> خود را وارد کنید:", parse_mode=ParseMode.HTML)
-
-@router.message(LoginStates.waiting_for_password)
-async def process_password(message: Message, state: FSMContext):
-    await state.update_data(password=message.text.strip())
-    user_data = await state.get_data()
-    
-    # نمایش در حال پردازش
-    processing_msg = await message.answer("⏳ <b>در حال لاگین...</b>", parse_mode=ParseMode.HTML)
-    
-    # انجام لاگین
-    result, msg, challenge_type = await instagram_manager.login_user(
-        message.from_user.id,
-        user_data['username'],
-        user_data['password']
-    )
-    
-    if result:
-        await state.set_state(LoginStates.logged_in)
-        await processing_msg.edit_text(msg + "\n\n✅ <b>اکنون می‌توانید از /download استفاده کنید.</b>", parse_mode=ParseMode.HTML)
-    elif challenge_type == "2fa":
-        await state.set_state(LoginStates.waiting_for_2fa)
-        await processing_msg.edit_text(msg, parse_mode=ParseMode.HTML)
-    elif challenge_type == "challenge":
-        await state.set_state(LoginStates.waiting_for_challenge)
-        await processing_msg.edit_text(msg, parse_mode=ParseMode.HTML)
-    else:
-        await state.clear()
-        await processing_msg.edit_text(msg, parse_mode=ParseMode.HTML)
-
-@router.message(LoginStates.waiting_for_2fa)
-async def process_2fa(message: Message, state: FSMContext):
-    result, msg = await instagram_manager.handle_2fa(
-        message.from_user.id,
-        message.text.strip()
-    )
-    
-    if result:
-        await state.set_state(LoginStates.logged_in)
-        await message.answer(msg + "\n\n✅ <b>اکنون می‌توانید از /download استفاده کنید.</b>", parse_mode=ParseMode.HTML)
-    else:
-        await state.clear()
-        await message.answer(msg + "\n\nلطفا دوباره از /login شروع کنید.")
-
-@router.message(LoginStates.waiting_for_challenge)
-async def process_challenge(message: Message, state: FSMContext):
-    result, msg = await instagram_manager.handle_challenge(
-        message.from_user.id,
-        message.text.strip()
-    )
-    
-    if result:
-        await state.set_state(LoginStates.logged_in)
-        await message.answer(msg + "\n\n✅ <b>اکنون می‌توانید از /download استفاده کنید.</b>", parse_mode=ParseMode.HTML)
-    else:
-        await state.clear()
-        await message.answer(msg + "\n\nلطفا دوباره از /login شروع کنید.")
-
-@router.message(Command("download"))
-async def cmd_download(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != LoginStates.logged_in:
-        await message.answer("❌ ابتدا باید لاگین کنید. از /login استفاده کنید.")
-        return
-    
-    await state.set_state(UserSelectionStates.waiting_for_username)
-    await message.answer(
-        "👤 لطفا <b>نام کاربری اینستاگرام</b> مورد نظر را وارد کنید:\n\n"
-        "<i>مثال: instagram یا barackobama</i>\n\n"
-        "⚠️ توجه: کاربر باید عمومی باشد یا شما باید او را فالو کرده باشید.",
-        parse_mode=ParseMode.HTML
-    )
-
-@router.message(UserSelectionStates.waiting_for_username)
-async def process_target_username(message: Message, state: FSMContext):
-    target_username = message.text.strip().replace("@", "")
-    
-    # ذخیره نام کاربری هدف
-    user_data = instagram_manager.user_data.get(message.from_user.id, {})
-    user_data["target_user"] = target_username
-    instagram_manager.user_data[message.from_user.id] = user_data
-    
-    await state.set_state(UserSelectionStates.waiting_for_action)
-    
-    # نمایش منو
-    await message.answer(
-        f"🎯 کاربر انتخاب شده: <b>@{target_username}</b>\n\n"
-        f"لطفا عملیات مورد نظر را انتخاب کنید:",
-        reply_markup=create_user_menu(),
-        parse_mode=ParseMode.HTML
-    )
-
-@router.callback_query(F.data.startswith("action_"))
-async def handle_action(callback: CallbackQuery, state: FSMContext):
-    action = callback.data
-    user_id = callback.from_user.id
-    
-    # دریافت اطلاعات کاربر هدف
-    user_data = instagram_manager.user_data.get(user_id, {})
-    target_username = user_data.get("target_user", "")
-    
-    if not target_username:
-        await callback.answer("❌ کاربری انتخاب نشده!")
-        return
-    
-    if action == "action_cancel":
-        await state.set_state(LoginStates.logged_in)
-        await callback.message.edit_text("❌ عملیات لغو شد.")
-        await callback.answer()
-        return
-    
-    # نمایش در حال پردازش
-    processing_msg = await callback.message.answer("⏳ <b>در حال پردازش...</b>", parse_mode=ParseMode.HTML)
-    
-    if action == "action_profile_info":
-        # دریافت اطلاعات پروفایل
-        success, msg, info = await instagram_manager.get_user_info(user_id, target_username)
+    async def save_categorized_proxies(self, categorized_proxies):
+        """ذخیره پروکسی‌ها در فایل‌های جداگانه با aiofiles"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        if success and info:
-            response = f"📊 <b>اطلاعات پروفایل:</b>\n\n"
-            response += f"👤 <b>Username:</b> @{info['username']}\n"
-            response += f"📛 <b>Full Name:</b> {info['full_name']}\n"
-            response += f"👥 <b>Followers:</b> {info['followers']:,}\n"
-            response += f"🔁 <b>Following:</b> {info['following']:,}\n"
-            response += f"📸 <b>Posts:</b> {info['posts']}\n"
-            response += f"🔒 <b>Private:</b> {'بله' if info['is_private'] else 'خیر'}\n"
-            response += f"✅ <b>Verified:</b> {'بله' if info['is_verified'] else 'خیر'}\n"
-            if info['bio']:
-                response += f"📝 <b>Bio:</b> {info['bio']}\n"
-            
-            await processing_msg.edit_text(response, parse_mode=ParseMode.HTML)
-        else:
-            await processing_msg.edit_text(msg, parse_mode=ParseMode.HTML)
-    
-    elif action == "action_profile_pic":
-        # دانلود عکس پروفایل
-        success, caption, file_paths = await instagram_manager.download_profile_pic(user_id, target_username)
+        for category, proxies in categorized_proxies.items():
+            if proxies and category != 'all':
+                filename = f"proxies_{category}_{timestamp}.txt"
+                async with aiofiles.open(filename, 'w', encoding='utf-8') as f:
+                    await f.write('\n'.join(proxies))
+                print(f"💾 {len(proxies)} پروکسی {category} در {filename} ذخیره شد")
         
-        if success and file_paths:
-            for file_path in file_paths:
-                if file_path.endswith('.jpg') or file_path.endswith('.png'):
-                    file = FSInputFile(file_path)
-                    await callback.message.answer_photo(file, caption=caption[:1000], parse_mode=ParseMode.HTML)
-            
-            await processing_msg.delete()
-        else:
-            await processing_msg.edit_text(caption, parse_mode=ParseMode.HTML)
+        # ذخیره همه پروکسی‌ها در یک فایل
+        all_proxies = categorized_proxies.get('all', [])
+        if all_proxies:
+            filename = f"all_proxies_{timestamp}.txt"
+            async with aiofiles.open(filename, 'w', encoding='utf-8') as f:
+                await f.write('\n'.join(all_proxies))
+            print(f"📁 همه پروکسی‌ها ({len(all_proxies)}) در {filename} ذخیره شد")
+
+# ============================
+# کلاس مدیریت پروکسی پیشرفته
+# ============================
+class AdvancedProxyManager:
+    def __init__(self):
+        self.ua = UserAgent()
+        self.online_fetcher = OnlineProxyFetcher()
+        self.categorized_proxies = {}
+    
+    async def update_progress_in_telegram(self, bot, chat_id, message_id, **kwargs):
+        """آپدیت پیشرفت در پیام تلگرام"""
+        stage = kwargs.get('stage', '')
+        progress = kwargs.get('progress', 0)
+        current = kwargs.get('current', 0)
+        total = kwargs.get('total', 0)
+        found = kwargs.get('found', 0)
+        verified = kwargs.get('verified', 0)
+        categorized = kwargs.get('categorized', 0)
+        error = kwargs.get('error', '')
         
-        # پاکسازی فایل‌ها
-        instagram_manager.cleanup_temp_files(file_paths)
-    
-    elif action == "action_stories":
-        # دانلود استوری‌ها
-        success, caption, file_paths = await instagram_manager.download_stories(user_id, target_username)
+        # ایجاد متن پیشرفت
+        progress_bar = self._create_progress_bar(progress)
         
-        if success and file_paths:
-            # ارسال فایل‌های مدیا
-            media_files = [fp for fp in file_paths if not fp.endswith('.txt')]
-            txt_files = [fp for fp in file_paths if fp.endswith('.txt')]
-            
-            # ارسال مدیاها
-            for file_path in media_files[:10]:  # حداکثر 10 فایل
-                try:
-                    file = FSInputFile(file_path)
-                    if file_path.lower().endswith(('.mp4', '.mov', '.avi')):
-                        await callback.message.answer_video(file)
-                    else:
-                        await callback.message.answer_photo(file)
-                except:
-                    continue
-            
-            # ارسال فایل اطلاعات
-            if txt_files:
-                file = FSInputFile(txt_files[0])
-                await callback.message.answer_document(file, caption=caption[:1000], parse_mode=ParseMode.HTML)
-            
-            await processing_msg.delete()
-        else:
-            await processing_msg.edit_text(caption, parse_mode=ParseMode.HTML)
-        
-        # پاکسازی فایل‌ها
-        instagram_manager.cleanup_temp_files(file_paths)
-    
-    elif action == "action_highlights":
-        # دانلود هایلایت‌ها
-        success, caption, file_paths = await instagram_manager.download_highlights(user_id, target_username)
-        
-        if success and file_paths:
-            # ارسال فایل اطلاعات
-            txt_files = [fp for fp in file_paths if fp.endswith('.txt')]
-            if txt_files:
-                file = FSInputFile(txt_files[0])
-                await callback.message.answer_document(file, caption=caption[:1000], parse_mode=ParseMode.HTML)
-            
-            await processing_msg.delete()
-        else:
-            await processing_msg.edit_text(caption, parse_mode=ParseMode.HTML)
-        
-        # پاکسازی فایل‌ها
-        instagram_manager.cleanup_temp_files(file_paths)
-    
-    elif action == "action_posts":
-        # نمایش منوی تعداد پست
-        await processing_msg.delete()
-        await callback.message.answer(
-            "📊 لطفا تعداد پست‌هایی که می‌خواهید دانلود کنید را انتخاب کنید:",
-            reply_markup=create_post_count_menu()
-        )
-    
-    elif action == "action_followers":
-        # نمایش منوی تعداد فالوور
-        await processing_msg.delete()
-        await callback.message.answer(
-            "👥 لطفا تعداد فالوورهایی که می‌خواهید دریافت کنید را انتخاب کنید:",
-            reply_markup=create_follower_count_menu()
-        )
-    
-    await callback.answer()
+        if error:
+            text = f"""
+❌ **خطا در دریافت پروکسی‌ها**
 
-@router.callback_query(F.data.startswith("count_"))
-async def handle_post_count(callback: CallbackQuery, state: FSMContext):
-    count_data = callback.data
-    user_id = callback.from_user.id
-    
-    # دریافت اطلاعات کاربر هدف
-    user_data = instagram_manager.user_data.get(user_id, {})
-    target_username = user_data.get("target_user", "")
-    
-    if not target_username:
-        await callback.answer("❌ کاربری انتخاب نشده!")
-        return
-    
-    # تعیین تعداد
-    if count_data == "count_12":
-        count = 12
-    elif count_data == "count_24":
-        count = 24
-    elif count_data == "count_50":
-        count = 50
-    elif count_data == "count_100":
-        count = 100
-    else:
-        count = 12
-    
-    # نمایش در حال پردازش
-    processing_msg = await callback.message.answer(f"⏳ <b>در حال دانلود {count} پست آخر...</b>", parse_mode=ParseMode.HTML)
-    
-    # دانلود پست‌ها
-    success, caption, file_paths = await instagram_manager.download_posts(user_id, target_username, count)
-    
-    if success and file_paths:
-        # ارسال فایل اطلاعات
-        txt_files = [fp for fp in file_paths if fp.endswith('.txt')]
-        if txt_files:
-            file = FSInputFile(txt_files[0])
-            await callback.message.answer_document(file, caption=caption[:1000], parse_mode=ParseMode.HTML)
-        
-        await processing_msg.delete()
-    else:
-        await processing_msg.edit_text(caption, parse_mode=ParseMode.HTML)
-    
-    # پاکسازی فایل‌ها
-    instagram_manager.cleanup_temp_files(file_paths)
-    await callback.answer()
+📝 خطا: `{error}`
 
-@router.callback_query(F.data.startswith("fcount_"))
-async def handle_follower_count(callback: CallbackQuery, state: FSMContext):
-    count_data = callback.data
-    user_id = callback.from_user.id
-    
-    # دریافت اطلاعات کاربر هدف
-    user_data = instagram_manager.user_data.get(user_id, {})
-    target_username = user_data.get("target_user", "")
-    
-    if not target_username:
-        await callback.answer("❌ کاربری انتخاب نشده!")
-        return
-    
-    # تعیین تعداد
-    if count_data == "fcount_100":
-        count = 100
-    elif count_data == "fcount_500":
-        count = 500
-    elif count_data == "fcount_1000":
-        count = 1000
-    elif count_data == "fcount_all":
-        count = 5000  # حداکثر
-    else:
-        count = 100
-    
-    # نمایش در حال پردازش
-    processing_msg = await callback.message.answer(f"⏳ <b>در حال دریافت {count} فالوور...</b>", parse_mode=ParseMode.HTML)
-    
-    # دریافت فالوورها
-    success, caption, file_paths = await instagram_manager.download_followers(user_id, target_username, count)
-    
-    if success and file_paths:
-        # ارسال فایل TXT
-        if file_paths:
-            file = FSInputFile(file_paths[0])
-            await callback.message.answer_document(file, caption=caption[:1000], parse_mode=ParseMode.HTML)
-        
-        await processing_msg.delete()
-    else:
-        await processing_msg.edit_text(caption, parse_mode=ParseMode.HTML)
-    
-    # پاکسازی فایل‌ها
-    instagram_manager.cleanup_temp_files(file_paths)
-    await callback.answer()
-
-@router.message(Command("logout"))
-async def cmd_logout(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    
-    # حذف کلاینت کاربر
-    if user_id in instagram_manager.clients:
-        del instagram_manager.clients[user_id]
-    
-    # حذف داده‌های کاربر
-    if user_id in instagram_manager.user_data:
-        del instagram_manager.user_data[user_id]
-    
-    # حذف فایل سشن
-    session_files = list(instagram_manager.session_dir.glob(f"{user_id}_*"))
-    for file in session_files:
-        try:
-            file.unlink()
-        except:
-            pass
-    
-    await state.clear()
-    await message.answer("✅ از حساب خود خارج شدید. تمام داده‌ها حذف شدند.")
-
-@router.message(Command("status"))
-async def cmd_status(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    user_id = message.from_user.id
-    
-    if current_state == LoginStates.logged_in:
-        user_data = instagram_manager.user_data.get(user_id, {})
-        username = user_data.get("username", "نامشخص")
-        
-        response = f"✅ <b>وضعیت: لاگین شده</b>\n\n"
-        response += f"👤 <b>اکانت:</b> @{username}\n"
-        response += f"📋 <b>دستورات قابل استفاده:</b>\n"
-        response += f"• /download - انتخاب کاربر و عملیات\n"
-        response += f"• /logout - خروج از حساب\n"
-        response += f"• /status - وضعیت فعلی\n"
-        
-        await message.answer(response, parse_mode=ParseMode.HTML)
-    else:
-        await message.answer("❌ <b>وضعیت: لاگین نشده</b>\n\nلطفا از /login استفاده کنید.", parse_mode=ParseMode.HTML)
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    help_text = """
-📖 <b>راهنمای کامل ربات اینستاگرام</b>
-
-<b>مراحل کار:</b>
-1. ابتدا با دستور /login وارد حساب اینستاگرام خود شوید
-2. سپس با /download نام کاربری مورد نظر را وارد کنید
-3. عملیات مورد نظر را از منو انتخاب کنید
-
-<b>📋 عملیات‌های قابل انجام:</b>
-• <b>اطلاعات پروفایل</b> - مشاهده اطلاعات کامل کاربر
-• <b>عکس پروفایل</b> - دانلود عکس پروفایل با کیفیت HD
-• <b>استوری‌ها</b> - دانلود استوری‌های فعال کاربر
-• <b>هایلایت‌ها</b> - دانلود هایلایت‌های کاربر
-• <b>پست‌ها</b> - دانلود پست‌های کاربر (قابل انتخاب تعداد)
-• <b>فالوورها</b> - دریافت لیست فالوورهای کاربر
-
-<b>⚠️ نکات مهم:</b>
-• کاربر هدف باید عمومی باشد یا شما او را فالو کرده باشید
-• برای امنیت بیشتر، از یک اکانت dummy استفاده کنید
-• دانلود حجم بالا ممکن است باعث محدودیت موقت شود
-• از /logout برای خروج امن استفاده کنید
-
-<b>🔧 پشتیبانی فنی:</b>
-• کتابخانه: instagrapi
-• زبان: Python
-• رابط: Telegram Bot API
-
-<i>ربات توسط @ توسعه داده شده است.</i>
+⚠️ عملیات متوقف شد.
 """
-    await message.answer(help_text, parse_mode=ParseMode.HTML)
+        elif stage == "دریافت از منابع":
+            text = f"""
+🌐 **در حال دریافت پروکسی‌ها از اینترنت...**
 
-@router.message(F.text)
-async def handle_text(message: Message):
-    """مدیریت پیام‌های متنی عمومی"""
-    await message.answer(
-        "🤔 <b>دستور نامعتبر</b>\n\n"
-        "از منو استفاده کنید:\n"
-        "/start - شروع\n"
-        "/login - ورود\n"
-        "/download - دانلود\n"
-        "/logout - خروج\n"
-        "/help - راهنمایی\n"
-        "/status - وضعیت",
-        parse_mode=ParseMode.HTML
-    )
+📋 **مرحله:** {stage}
+{progress_bar}
+📊 **پیشرفت:** {progress}%
 
+📥 منابع بررسی شده: {current}/{total}
+📦 پروکسی‌های یافت شده: {found}
+
+⏳ لطفاً صبر کنید...
+"""
+        elif stage == "تأیید سلامت پروکسی‌ها":
+            text = f"""
+🔍 **در حال تأیید سلامت پروکسی‌ها...**
+
+📋 **مرحله:** {stage}
+{progress_bar}
+📊 **پیشرفت:** {progress}%
+
+✅ پروکسی‌های تأیید شده: {verified}/{current}
+📦 کل پروکسی‌ها برای بررسی: {total}
+
+⏳ این مرحله ممکن است چند دقیقه طول بکشد...
+"""
+        elif stage == "تکمیل":
+            text = f"""
+✅ **دریافت پروکسی‌ها با موفقیت کامل شد!**
+
+🎉 **عملیات با موفقیت به پایان رسید**
+📦 پروکسی‌های نهایی: {categorized}
+
+📊 **در حال ذخیره‌سازی در فایل...**
+⏳ چند لحظه صبر کنید...
+"""
+        else:
+            text = f"""
+🔄 **در حال پردازش...**
+
+📋 **مرحله:** {stage}
+{progress_bar}
+📊 **پیشرفت:** {progress}%
+
+⏳ لطفاً صبر کنید...
+"""
+        
+        # آپدیت پیام
+        await bot.edit_message_text(chat_id, message_id, text, parse_mode='Markdown')
+    
+    def _create_progress_bar(self, percentage, length=20):
+        """ایجاد نوار پیشرفت"""
+        filled_length = int(length * percentage // 100)
+        bar = '█' * filled_length + '░' * (length - filled_length)
+        return f"[{bar}]"
+    
+    async def get_proxies(self, source_type='online', max_proxies=500, bot=None, chat_id=None, message_id=None):
+        """دریافت پروکسی‌ها از منابع مختلف با گزارش پیشرفت"""
+        
+        if source_type == 'online':
+            print("🌍 در حال دریافت پروکسی‌ها از اینترنت...")
+            
+            # تابع callback برای آپدیت پیشرفت
+            async def update_callback(**kwargs):
+                if bot and chat_id and message_id:
+                    await self.update_progress_in_telegram(bot, chat_id, message_id, **kwargs)
+            
+            self.categorized_proxies = await self.online_fetcher.fetch_and_verify_proxies(
+                update_progress_callback=update_callback,
+                max_proxies=max_proxies
+            )
+            return self.categorized_proxies
+        else:
+            print("❌ نوع منبع پشتیبانی نمی‌شود")
+            return {}
+    
+    def get_proxy_count(self):
+        """دریافت تعداد پروکسی‌های دسته‌بندی شده"""
+        counts = {}
+        total = 0
+        
+        for category, proxies in self.categorized_proxies.items():
+            count = len(proxies)
+            counts[category] = count
+            total += count
+        
+        counts['total'] = total
+        return counts
+    
+    async def save_all_proxies(self, filename="all_proxies_combined.txt"):
+        """ذخیره همه پروکسی‌ها در یک فایل با aiofiles"""
+        all_proxies = []
+        
+        for category, proxies in self.categorized_proxies.items():
+            if category != 'all':  # از تکرار جلوگیری کن
+                all_proxies.extend(proxies)
+        
+        # حذف duplicates
+        unique_proxies = list(set(all_proxies))
+        
+        if unique_proxies:
+            async with aiofiles.open(filename, 'w', encoding='utf-8') as f:
+                await f.write('\n'.join(unique_proxies))
+            
+            print(f"💾 {len(unique_proxies)} پروکسی منحصربه‌فرد در {filename} ذخیره شد")
+            return filename
+        
+        return None
+
+# ============================
+# کلاس HTTP Client با aiohttp
+# ============================
+class AsyncHTTPClient:
+    def __init__(self):
+        self.ua = UserAgent()
+        self.timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
+    
+    async def make_request(self, method: str, url: str, **kwargs) -> Optional[aiohttp.ClientResponse]:
+        """ایجاد درخواست HTTP ناهمزمان"""
+        headers = kwargs.get('headers', {})
+        if 'User-Agent' not in headers:
+            headers['User-Agent'] = self.ua.random
+        
+        kwargs['headers'] = headers
+        kwargs['timeout'] = self.timeout
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.request(method, url, **kwargs) as response:
+                    return response
+        except Exception as e:
+            print(f"❌ خطا در درخواست HTTP: {e}")
+            return None
+
+# ============================
+# کلاس ثبت ویو تلگرام با aiohttp
+# ============================
+class TelegramViewSender:
+    def __init__(self):
+        self.ua = UserAgent()
+        
+    async def fetch_post_data(self, channel, post, proxy=None):
+        """دریافت اطلاعات پست تلگرام"""
+        try:
+            url = f'https://t.me/{channel}/{post}?embed=1'
+            headers = {
+                'User-Agent': self.ua.random,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'DNT': '1',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            
+            connector = None
+            if proxy:
+                connector = aiohttp.TCPConnector(ssl=False)
+            
+            async with aiohttp.ClientSession(connector=connector) as session:
+                if proxy:
+                    session.proxy = proxy
+                
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as response:
+                    if response.status != 200:
+                        return None
+                    
+                    html_content = await response.text()
+                    
+                    # استخراج کلید از HTML
+                    if 'data-view="' in html_content:
+                        key = html_content.split('data-view="')[1].split('"')[0]
+                    else:
+                        # تلاش با regex
+                        import re
+                        match = re.search(r'data-view="([^"]+)"', html_content)
+                        key = match.group(1) if match else None
+                    
+                    # استخراج کوکی
+                    cookies = response.cookies
+                    cookie_str = ""
+                    for cookie in cookies:
+                        cookie_str += f"{cookie.key}={cookie.value}; "
+                    
+                    if key and cookie_str:
+                        return {
+                            'key': key, 
+                            'cookie': cookie_str.strip(), 
+                            'channel': channel, 
+                            'post': post
+                        }
+                    
+        except Exception as e:
+            print(f"❌ خطا در دریافت داده‌ها: {e}")
+        
+        return None
+    
+    async def send_view_async(self, post_data, proxy=None):
+        """ارسال ویو به پست"""
+        try:
+            url = f'https://t.me/v/?views={post_data["key"]}'
+            headers = {
+                'User-Agent': self.ua.random,
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Connection': 'keep-alive',
+                'Referer': f'https://t.me/{post_data["channel"]}/{post_data["post"]}?embed=1',
+                'Cookie': post_data['cookie'],
+            }
+            
+            connector = None
+            if proxy:
+                connector = aiohttp.TCPConnector(ssl=False)
+            
+            async with aiohttp.ClientSession(connector=connector) as session:
+                if proxy:
+                    session.proxy = proxy
+                
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)) as response:
+                    return response.status == 200
+                    
+        except Exception as e:
+            print(f"❌ خطا در ارسال ویو: {e}")
+        
+        return False
+    
+    async def process_batch_async(self, channel, post, proxy_list, callback=None):
+        """پردازش دسته‌ای با پروکسی‌ها"""
+        success_count = 0
+        
+        # دریافت اطلاعات پست یک بار
+        post_data = await self.fetch_post_data(channel, post)
+        if not post_data:
+            return 0
+        
+        total = len(proxy_list)
+        
+        # ایجاد تسک‌ها
+        tasks = []
+        for i, proxy in enumerate(proxy_list):
+            task = self.send_view_task(post_data, proxy)
+            tasks.append((i, task))
+            
+            # گزارش پیشرفت
+            if callback and i % 10 == 0:
+                progress = int((i / total) * 100)
+                callback(progress, i, total)
+        
+        # اجرای همه تسک‌ها
+        results = []
+        for i, task in tasks:
+            try:
+                result = await task
+                results.append((i, result))
+            except:
+                results.append((i, False))
+            
+            # گزارش پیشرفت
+            if callback and i % 10 == 0:
+                progress = int((i / total) * 100)
+                callback(progress, i, total)
+        
+        # شمارش موفقیت‌ها
+        for i, result in results:
+            if result:
+                success_count += 1
+        
+        return success_count
+    
+    async def send_view_task(self, post_data, proxy):
+        """تسک ارسال ویو"""
+        return await self.send_view_async(post_data, proxy)
+
+# ============================
+# کلاس ربات تلگرام با aiohttp (اصلاح شده)
+# ============================
+class TelegramBot:
+    def __init__(self):
+        self.token = TOKEN
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self.proxy_manager = AdvancedProxyManager()
+        self.view_sender = TelegramViewSender()
+        
+    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+        """ارسال پیام"""
+        url = f"{self.base_url}/sendMessage"
+        
+        payload = {
+            'chat_id': chat_id,
+            'text': text
+        }
+        
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        
+        if reply_markup:
+            payload['reply_markup'] = json.dumps(reply_markup)
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('result', {})
+        
+        return None
+    
+    async def send_document(self, chat_id, document_path, caption=None):
+        """ارسال فایل - اصلاح شده"""
+        url = f"{self.base_url}/sendDocument"
+        
+        data = aiohttp.FormData()
+        data.add_field('chat_id', str(chat_id))
+        
+        if caption:
+            data.add_field('caption', caption)
+            
+        # فایل باید در حین ارسال باز بماند
+        try:
+            with open(document_path, 'rb') as file:
+                data.add_field('document', file, filename=os.path.basename(document_path))
+                
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, data=data) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        else:
+                            print(f"Error sending document: {await response.text()}")
+        except Exception as e:
+            print(f"File upload error: {e}")
+        
+        return None
+    
+    async def edit_message_text(self, chat_id, message_id, text, parse_mode=None):
+        """ویرایش پیام"""
+        url = f"{self.base_url}/editMessageText"
+        
+        payload = {
+            'chat_id': chat_id,
+            'message_id': message_id,
+            'text': text
+        }
+        
+        if parse_mode:
+            payload['parse_mode'] = parse_mode
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                if response.status == 200:
+                    return await response.json()
+        
+        return None
+    
+    async def answer_callback_query(self, callback_query_id, text=None, show_alert=False):
+        """پاسخ به کوئری callback"""
+        url = f"{self.base_url}/answerCallbackQuery"
+        
+        payload = {
+            'callback_query_id': callback_query_id,
+            'show_alert': show_alert
+        }
+        
+        if text:
+            payload['text'] = text
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload) as response:
+                return response.status == 200
+    
+    async def get_updates(self, offset=None, timeout=30):
+        """دریافت آپدیت‌ها"""
+        url = f"{self.base_url}/getUpdates"
+        
+        params = {
+            'timeout': timeout
+        }
+        
+        if offset:
+            params['offset'] = offset
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('result', [])
+        
+        return []
+    
+    async def set_webhook(self, url):
+        """تنظیم webhook"""
+        webhook_url = f"{self.base_url}/setWebhook"
+        
+        payload = {
+            'url': url
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(webhook_url, json=payload) as response:
+                return response.status == 200
+
+# ============================
+# توابع اصلی ربات
+# ============================
+class BotHandler:
+    def __init__(self):
+        self.bot = TelegramBot()
+        self.proxy_manager = AdvancedProxyManager()
+        self.view_sender = TelegramViewSender()
+        
+    def create_keyboard(self, buttons):
+        """ایجاد صفحه کلید شیشه‌ای"""
+        keyboard = []
+        for row in buttons:
+            keyboard_row = []
+            for button in row:
+                if isinstance(button, tuple):
+                    text, callback_data = button
+                    keyboard_row.append({"text": text, "callback_data": callback_data})
+                else:
+                    keyboard_row.append({"text": button, "callback_data": button})
+            keyboard.append(keyboard_row)
+        
+        return {"inline_keyboard": keyboard}
+    
+    async def handle_start(self, chat_id, user):
+        """مدیریت دستور /start"""
+        add_user(user['id'], user.get('username', ''), user.get('first_name', ''), user.get('last_name', ''))
+        
+        keyboard = self.create_keyboard([
+            [("📄 آپلود فایل پروکسی", "upload_proxy")],
+            [("🌐 دریافت پروکسی آنلاین", "fetch_online_proxies")],
+            [("🔗 ارسال لینک تلگرام", "upload_link")],
+            [("📊 آمار ربات", "stats")],
+            [("⚙️ پنل مدیریت", "admin_panel")]
+        ])
+        
+        welcome_text = """
+🤖 **ربات حرفه‌ای چکر پروکسی و افزایش ویو تلگرام**
+
+🔥 **ویژگی جدید: دریافت خودکار پروکسی از اینترنت!**
+• دریافت از 30+ منبع معتبر
+• تأیید خودکار سلامت پروکسی‌ها
+• گزارش پیشرفت زنده در ربات
+• طبقه‌بندی پروکسی بر اساس ISP
+• ذخیره خودکار در فایل‌های مختلف
+
+🔹 **امکانات اصلی:**
+• چک کردن پروکسی‌های HTTP/HTTPS/SOCKS4/SOCKS5
+• افزایش ویو پست‌های تلگرام
+• پنل مدیریت پیشرفته
+• آمار لحظه‌ای
+
+🔹 **نحوه استفاده:**
+1️⃣ ابتدا پروکسی دریافت کنید (آپلود یا دریافت آنلاین)
+2️⃣ سپس لینک پست تلگرام را ارسال کنید
+3️⃣ عملیات به صورت خودکار شروع می‌شود
+
+👨‍💻 **توسعه‌دهنده:** @Erfan138600
+"""
+        
+        await self.bot.send_message(chat_id, welcome_text, parse_mode='Markdown', reply_markup=keyboard)
+    
+    async def handle_fetch_online_proxies(self, chat_id, message_id):
+        """دریافت پروکسی‌ها از منابع آنلاین با گزارش پیشرفت"""
+        # ارسال پیام اولیه
+        initial_text = """
+🌐 **شروع دریافت پروکسی‌ها از اینترنت...**
+
+⏳ در حال اتصال به منابع...
+📋 **مرحله:** آماده‌سازی
+[░░░░░░░░░░░░░░░░░░░░] 0%
+
+📊 **لطفاً صبر کنید، این عملیات ممکن است چند دقیقه طول بکشد...**
+"""
+        
+        progress_msg = await self.bot.send_message(chat_id, initial_text, parse_mode='Markdown')
+        
+        try:
+            # دریافت پروکسی‌ها با گزارش پیشرفت
+            proxies = await self.proxy_manager.get_proxies(
+                'online', 
+                500,
+                bot=self.bot,
+                chat_id=chat_id,
+                message_id=progress_msg['message_id']
+            )
+            
+            if not proxies:
+                final_text = """
+❌ **دریافت پروکسی‌ها ناموفق بود!**
+
+⚠️ **خطا:** هیچ پروکسی سالمی یافت نشد!
+
+🔧 **راه‌حل‌های ممکن:**
+1️⃣ اتصال اینترنت خود را بررسی کنید
+2️⃣ بعداً دوباره تلاش کنید
+3️⃣ از فایل پروکسی آپلود شده استفاده کنید
+
+📊 برای دریافت مجدد روی «دریافت پروکسی آنلاین» کلیک کنید.
+"""
+                await self.bot.edit_message_text(
+                    chat_id, 
+                    progress_msg['message_id'], 
+                    final_text, 
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # نمایش آمار نهایی
+            counts = self.proxy_manager.get_proxy_count()
+            
+            stats_text = f"""
+✅ **دریافت پروکسی‌ها با موفقیت کامل شد!**
+
+🎉 **عملیات با موفقیت به پایان رسید**
+
+📊 **آمار پروکسی‌های دریافتی:**
+
+🔸 **بر اساس نوع:**
+├ HTTP: {counts.get('http', 0)} پروکسی
+├ HTTPS: {counts.get('https', 0)} پروکسی
+├ SOCKS4: {counts.get('socks4', 0)} پروکسی
+└ SOCKS5: {counts.get('socks5', 0)} پروکسی
+
+🔸 **بر اساس ISP/منطقه:**
+├ ایران: {counts.get('iran', 0)} پروکسی
+└ تلگرام: {counts.get('telegram', 0)} پروکسی
+
+📈 **مجموع: {counts.get('total', 0)} پروکسی سالم**
+
+💾 پروکسی‌ها به طور خودکار در فایل‌های txt ذخیره شدند.
+
+📁 **در حال ارسال فایل پروکسی‌ها...**
+"""
+            
+            await self.bot.edit_message_text(
+                chat_id, 
+                progress_msg['message_id'], 
+                stats_text, 
+                parse_mode='Markdown'
+            )
+            
+            # ارسال فایل ترکیبی
+            combined_file = await self.proxy_manager.save_all_proxies()
+            if combined_file and os.path.exists(combined_file):
+                await self.bot.send_document(
+                    chat_id, 
+                    combined_file, 
+                    caption="📁 **فایل حاوی همه پروکسی‌های سالم**\n\n✅ آماده استفاده برای افزایش ویو!"
+                )
+                
+                # حذف فایل موقت
+                await asyncio.sleep(30)
+                try:
+                    os.remove(combined_file)
+                except:
+                    pass
+            
+        except Exception as e:
+            error_text = f"""
+❌ **خطا در دریافت پروکسی‌ها!**
+
+⚠️ **خطای فنی:** `{str(e)}`
+
+🔧 **علت احتمالی:**
+• مشکل اتصال اینترنت
+• محدودیت سرور
+• مشکل در منابع پروکسی
+
+📊 لطفاً بعداً دوباره تلاش کنید یا از فایل پروکسی آپلود شده استفاده کنید.
+"""
+            await self.bot.edit_message_text(
+                chat_id, 
+                progress_msg['message_id'], 
+                error_text, 
+                parse_mode='Markdown'
+            )
+    
+    async def handle_callback_query(self, callback_query, message):
+        """مدیریت کلیک روی دکمه‌ها - اصلاح شده"""
+        data = callback_query.get('data')
+        chat_id = message['chat']['id']
+        message_id = message['message_id']
+        user_id = callback_query['from']['id']
+        
+        await self.bot.answer_callback_query(callback_query['id'])
+        
+        if data == 'upload_proxy':
+            text = (
+                "📁 لطفاً فایل txt حاوی پروکسی‌ها را ارسال کنید.\n\n"
+                "💡 **فرمت‌های پشتیبانی شده:**\n"
+                "• http://user:pass@host:port\n"
+                "• https://host:port\n"
+                "• socks4://host:port\n"
+                "• socks5://host:port\n"
+                "• host:port:user:pass\n"
+                "• host:port\n"
+                "\n⚠️ حداکثر حجم فایل: 20 مگابایت"
+            )
+            await self.bot.edit_message_text(chat_id, message_id, text)
+            
+        elif data == 'fetch_online_proxies':
+            await self.handle_fetch_online_proxies(chat_id, message_id)
+            
+        elif data == 'upload_link':
+            text = "🔗 لطفاً لینک پست تلگرام را ارسال کنید:\n\nمثال: https://t.me/channel/123"
+            await self.bot.edit_message_text(chat_id, message_id, text)
+            
+        elif data == 'stats':
+            await self.show_stats(chat_id, message_id)
+            
+        elif data == 'admin_panel':
+            await self.show_admin_panel(chat_id, message_id, user_id)
+
+        # --- بخش‌های اضافه شده برای دکمه‌های ادمین ---
+        elif data == 'back_to_main':
+            # بازگشت به منوی اصلی
+            await self.handle_start(chat_id, {'id': user_id, 'first_name': ''})
+            
+        elif data == 'live_stats':
+            if user_id in ADMINS:
+                await self.show_stats(chat_id, message_id)
+            else:
+                await self.bot.answer_callback_query(callback_query['id'], text="⛔ دسترسی ندارید!", show_alert=True)
+
+        elif data == 'admin_fetch_proxies':
+            if user_id in ADMINS:
+                await self.handle_fetch_online_proxies(chat_id, message_id)
+            else:
+                await self.bot.answer_callback_query(callback_query['id'], text="⛔ دسترسی ندارید!", show_alert=True)
+    
+    async def handle_document(self, message):
+        """مدیریت دریافت فایل"""
+        chat_id = message['chat']['id']
+        document = message.get('document', {})
+        
+        if not document:
+            await self.bot.send_message(chat_id, "❌ لطفاً یک فایل ارسال کنید.")
+            return
+        
+        # بررسی حجم فایل
+        if document.get('file_size', 0) > MAX_FILE_SIZE:
+            await self.bot.send_message(chat_id, "❌ حجم فایل بیشتر از 20 مگابایت است.")
+            return
+        
+        # بررسی فرمت فایل
+        file_name = document.get('file_name', '')
+        if not file_name.endswith('.txt'):
+            await self.bot.send_message(chat_id, "❌ فقط فایل‌های txt پشتیبانی می‌شوند.")
+            return
+        
+        await self.bot.send_message(chat_id, "📥 در حال دانلود فایل...")
+        
+        # اینجا باید فایل دانلود شود و پردازش شود
+        await self.bot.send_message(chat_id, "✅ فایل دریافت شد. این قابلیت نیاز به پیاده‌سازی کامل‌تر دارد.")
+    
+    async def handle_text(self, message):
+        """مدیریت دریافت متن"""
+        chat_id = message['chat']['id']
+        text = message.get('text', '').strip()
+        
+        if text.startswith('/'):
+            if text == '/start':
+                await self.handle_start(chat_id, message['from'])
+            elif text == '/fetch':
+                # دریافت پیام فعلی برای آپدیت
+                await self.handle_fetch_online_proxies(chat_id, message['message_id'])
+        elif 't.me/' in text:
+            await self.bot.send_message(chat_id, f"🔗 لینک دریافت شد: {text}\n\nاین قابلیت نیاز به پیاده‌سازی کامل‌تر دارد.")
+        else:
+            await self.bot.send_message(chat_id, "پیام شما دریافت شد.")
+    
+    async def show_stats(self, chat_id, message_id):
+        """نمایش آمار ربات"""
+        stats, today_orders = get_stats()
+        
+        if stats:
+            text = f"""
+📊 **آمار کامل ربات:**
+
+👥 **کاربران:**
+├ کل کاربران: {stats[0]}
+└ فعال امروز: {today_orders}
+
+🔧 **پروکسی‌ها:**
+├ پردازش شده: {stats[1]}
+└ حذف شده: {stats[2]}
+
+🎯 **ویو‌ها:**
+├ کل ویو ارسال شده: {stats[3]}
+└ سفارشات: {stats[4]}
+
+🕒 آخرین فعالیت: {stats[5]}
+📅 تاریخ: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+"""
+        else:
+            text = "❌ آمار یافت نشد."
+        
+        await self.bot.edit_message_text(chat_id, message_id, text, parse_mode='Markdown')
+    
+    async def show_admin_panel(self, chat_id, message_id, user_id):
+        """نمایش پنل مدیریت"""
+        if user_id not in ADMINS:
+            await self.bot.edit_message_text(chat_id, message_id, "❌ دسترسی غیرمجاز!")
+            return
+        
+        keyboard = self.create_keyboard([
+            [("📊 آمار لحظه‌ای", "live_stats")],
+            [("🌐 دریافت پروکسی", "admin_fetch_proxies")],
+            [("📨 پیام همگانی", "broadcast")],
+            [("🧹 پاکسازی دیتابیس", "cleanup")],
+            [("🔙 بازگشت", "back_to_main")]
+        ])
+        
+        text = "⚙️ **پنل مدیریت پیشرفته**\n\nلطفاً یکی از گزینه‌ها را انتخاب کنید:"
+        
+        await self.bot.edit_message_text(chat_id, message_id, text, parse_mode='Markdown', reply_markup=keyboard)
+    
+    async def process_updates(self):
+        """پردازش آپدیت‌ها"""
+        offset = None
+        
+        while True:
+            try:
+                updates = await self.bot.get_updates(offset, timeout=30)
+                
+                for update in updates:
+                    offset = update['update_id'] + 1
+                    
+                    if 'message' in update:
+                        message = update['message']
+                        
+                        if 'document' in message:
+                            await self.handle_document(message)
+                        elif 'text' in message:
+                            await self.handle_text(message)
+                    
+                    elif 'callback_query' in update:
+                        callback_query = update['callback_query']
+                        message = callback_query.get('message', {})
+                        await self.handle_callback_query(callback_query, message)
+                
+                # وقفه کوتاه برای جلوگیری از overload
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                print(f"❌ خطا در پردازش آپدیت: {e}")
+                await asyncio.sleep(5)
+
+# ============================
+# تابع اصلی
+# ============================
 async def main():
-    # بررسی توکن
-    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
-        logger.error("❌ لطفا ابتدا توکن ربات خود را در متغیر BOT_TOKEN قرار دهید!")
-        print("\n" + "="*60)
-        print("❌ لطفا ابتدا توکن ربات خود را در فایل قرار دهید:")
-        print("1. فایل را باز کنید")
-        print("2. خط 37 را پیدا کنید: BOT_TOKEN = \"YOUR_BOT_TOKEN_HERE\"")
-        print("3. YOUR_BOT_TOKEN_HERE را با توکن ربات خود جایگزین کنید")
-        print("="*60 + "\n")
-        return
+    """تابع اصلی اجرای ربات"""
+    # ایجاد دیتابیس
+    init_db()
     
-    # بررسی نسخه پایتون
-    if sys.version_info < (3, 7):
-        print("❌ این اسکریپت نیاز به پایتون 3.7 یا بالاتر دارد.")
-        sys.exit(1)
+    # ایجاد handler
+    handler = BotHandler()
     
-    # ایجاد بوت
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    storage = MemoryStorage()
-    dp = Dispatcher(storage=storage)
-    dp.include_router(router)
+    print("🤖 ربات فعال شد...")
+    print("🌐 قابلیت دریافت خودکار پروکسی از 30+ منبع فعال است")
+    print("📊 گزارش پیشرفت در داخل ربات نمایش داده می‌شود")
+    print("📁 برای دریافت پروکسی‌ها از منو استفاده کنید")
     
-    logger.info("🤖 ربات پیشرفته اینستاگرام شروع به کار کرد...")
-    print("\n" + "="*60)
-    print("✅ ربات با موفقیت راه‌اندازی شد!")
-    print(f"🤖 آدرس ربات: https://t.me/{(await bot.get_me()).username}")
-    print("👤 دستور /start را در ربات ارسال کنید")
-    print("="*60 + "\n")
-    
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await bot.session.close()
+    # شروع پردازش آپدیت‌ها
+    await handler.process_updates()
 
-if __name__ == "__main__":
+if __name__ == '__main__':
+    # اجرای event loop
     asyncio.run(main())
