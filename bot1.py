@@ -19,7 +19,7 @@ import time
 # ============================
 # تنظیمات اولیه
 # ============================
-TOKEN = '7880725906:AAFOl9it7XDtUY6-phnTc90tXq2rqFcME8M'
+TOKEN = '7880725906:AAHTNy_U8_MkX2tf3TVZl2z18kqUMf8AtAQ'
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 ADMINS = [5914346958]  # جایگزین کنید با user_id ادمین‌ها
 MAX_WORKERS = 500  # حداکثر Thread همزمان
