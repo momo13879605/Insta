@@ -37,13 +37,14 @@ TOKEN = '7880725906:AAHTNy_U8_MkX2tf3TVZl2z18kqUMf8AtAQ'
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 ADMINS = [5914346958]
 REQUEST_TIMEOUT = 30
-PROXY_SOURCES_TIMEOUT = 15
+PROXY_SOURCES_TIMEOUT = 10  # کاهش timeout برای منابع
 MAX_VIEWS_PER_PROXY = 5  # حداکثر تعداد ویو برای هر پروکسی
+MAX_CONCURRENT_TASKS = 5  # حداکثر وظایف همزمان
 
 # URLهای API تلگرام
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TOKEN}"
 
-# لیست منابع پروکسی (کاهش تعداد و حذف منابع مشکل‌دار)
+# لیست منابع پروکسی بهینه شده
 PROXY_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
@@ -124,7 +125,8 @@ def init_db():
             added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             last_used TIMESTAMP,
             use_count INTEGER DEFAULT 0,
-            success_count INTEGER DEFAULT 0
+            success_count INTEGER DEFAULT 0,
+            source TEXT DEFAULT 'unknown'
         )
     ''')
     
@@ -140,6 +142,7 @@ def init_db():
             status TEXT DEFAULT 'pending',
             start_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             end_time TIMESTAMP,
+            proxy_source TEXT DEFAULT 'mixed',
             FOREIGN KEY (user_id) REFERENCES users (user_id)
         )
     ''')
@@ -205,7 +208,7 @@ async def increment_stats(field, value=1):
         finally:
             conn.close()
 
-async def save_proxies_to_db(proxies):
+async def save_proxies_to_db(proxies, source='online'):
     """ذخیره پروکسی‌ها در دیتابیس و شمارش تکراری‌ها"""
     if not proxies:
         return 0, 0
@@ -231,9 +234,9 @@ async def save_proxies_to_db(proxies):
                 else:
                     try:
                         cursor.execute('''
-                            INSERT OR IGNORE INTO proxies (proxy_address, proxy_type)
-                            VALUES (?, ?)
-                        ''', (proxy_address, proxy_type))
+                            INSERT OR IGNORE INTO proxies (proxy_address, proxy_type, source)
+                            VALUES (?, ?, ?)
+                        ''', (proxy_address, proxy_type, source))
                         new_count += 1
                     except sqlite3.IntegrityError:
                         duplicate_count += 1
@@ -252,14 +255,14 @@ async def save_proxies_to_db(proxies):
             if "database is locked" in str(e):
                 logger.warning("⚠️ دیتابیس قفل شد، تلاش مجدد...")
                 await asyncio.sleep(1)
-                return await save_proxies_to_db(proxies)
+                return await save_proxies_to_db(proxies, source)
             else:
                 logger.error(f"خطای دیتابیس: {e}")
                 raise
         finally:
             conn.close()
         
-        logger.info(f"ذخیره پروکسی‌ها: {new_count} جدید، {duplicate_count} تکراری")
+        logger.info(f"ذخیره پروکسی‌ها: {new_count} جدید، {duplicate_count} تکراری، منبع: {source}")
         return new_count, duplicate_count
 
 async def get_stats():
@@ -290,40 +293,39 @@ async def get_stats():
             cursor.execute('SELECT COUNT(*) FROM view_orders WHERE DATE(start_time) = DATE("now")')
             today_orders = cursor.fetchone()[0]
             
-            cursor.execute('''
-                SELECT COUNT(*) FROM view_orders 
-                WHERE status = 'completed' 
-                AND DATE(start_time) = DATE("now")
-            ''')
+            cursor.execute('SELECT COUNT(*) FROM view_orders WHERE status = "completed" AND DATE(start_time) = DATE("now")')
             today_completed = cursor.fetchone()[0]
             
-            return stats, total_proxies, unique_types, today_orders, today_completed
+            # آمار منابع پروکسی
+            cursor.execute('SELECT source, COUNT(*) FROM proxies GROUP BY source')
+            proxy_sources = cursor.fetchall()
+            
+            return stats, total_proxies, unique_types, today_orders, today_completed, proxy_sources
         finally:
             conn.close()
 
-async def create_view_order(user_id, channel_username, post_id, target_views):
+async def create_view_order(user_id, channel_username, post_id, target_views, proxy_source='mixed'):
     """ایجاد سفارش جدید برای افزایش ویو"""
     async with db_lock:
         conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
         cursor = conn.cursor()
         try:
             cursor.execute('''
-                INSERT INTO view_orders (user_id, channel_username, post_id, target_views)
-                VALUES (?, ?, ?, ?)
-            ''', (user_id, channel_username, post_id, target_views))
+                INSERT INTO view_orders (user_id, channel_username, post_id, target_views, proxy_source)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, channel_username, post_id, target_views, proxy_source))
             order_id = cursor.lastrowid
             await increment_stats('total_orders')
             
             # آپدیت آمار کاربر
             cursor.execute('''
                 UPDATE users SET 
-                total_views_sent = total_views_sent + 0,
                 last_active = CURRENT_TIMESTAMP
                 WHERE user_id = ?
             ''', (user_id,))
             
             conn.commit()
-            logger.info(f"سفارش جدید ایجاد شد: order_id={order_id}, user_id={user_id}, target={target_views}")
+            logger.info(f"سفارش جدید ایجاد شد: order_id={order_id}, user_id={user_id}, target={target_views}, source={proxy_source}")
             return order_id
         finally:
             conn.close()
@@ -365,26 +367,29 @@ async def update_view_order(order_id, completed_views, status='processing'):
         finally:
             conn.close()
 
-async def get_proxies_for_view(limit=100):
-    """دریافت پروکسی‌ها برای ارسال ویو"""
+async def get_proxies_for_view(limit=100, min_success_rate=0.3):
+    """دریافت پروکسی‌ها برای ارسال ویو با بهترین کیفیت"""
     async with db_lock:
         conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
         cursor = conn.cursor()
         try:
-            # انتخاب پروکسی‌هایی که کمترین استفاده را داشته‌اند
+            # انتخاب پروکسی‌هایی با بهترین نرخ موفقیت
             cursor.execute('''
-                SELECT proxy_id, proxy_address, proxy_type 
+                SELECT proxy_id, proxy_address, proxy_type, 
+                       CASE WHEN use_count > 0 THEN CAST(success_count AS FLOAT) / use_count ELSE 1.0 END as success_rate
                 FROM proxies 
-                ORDER BY use_count ASC, last_used ASC
+                WHERE use_count < 10 OR (CAST(success_count AS FLOAT) / use_count) >= ?
+                ORDER BY success_rate DESC, use_count ASC
                 LIMIT ?
-            ''', (limit,))
+            ''', (min_success_rate, limit))
             
             proxies = []
             for row in cursor.fetchall():
                 proxies.append({
                     'proxy_id': row[0],
                     'proxy_address': row[1],
-                    'proxy_type': row[2]
+                    'proxy_type': row[2],
+                    'success_rate': row[3]
                 })
             
             return proxies
@@ -438,13 +443,15 @@ class ProxyFetcher:
     def __init__(self):
         self.ua = UserAgent()
         self.session = None
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)  # محدودیت کارهای همزمان
     
     async def initialize_session(self):
         """ایجاد session ناهمزمان"""
         if not self.session:
             self.session = aiohttp.ClientSession(
                 headers={'User-Agent': self.ua.random},
-                timeout=aiohttp.ClientTimeout(total=PROXY_SOURCES_TIMEOUT)
+                timeout=aiohttp.ClientTimeout(total=PROXY_SOURCES_TIMEOUT),
+                connector=aiohttp.TCPConnector(ssl=False, limit=10)
             )
     
     async def close_session(self):
@@ -496,56 +503,59 @@ class ProxyFetcher:
     
     async def fetch_from_source(self, source_url):
         """دریافت پروکسی‌ها از یک منبع با مدیریت خطاهای دیکد"""
-        try:
-            await self.initialize_session()
-            
-            async with self.session.get(source_url, ssl=False) as response:
-                if response.status == 200:
-                    # خواندن به صورت بایت و دیکد با مدیریت خطا
-                    data = await response.read()
-                    
-                    # تلاش برای دیکد با encoding‌های مختلف
-                    encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'ascii']
-                    text = None
-                    
-                    for encoding in encodings:
-                        try:
-                            text = data.decode(encoding)
-                            break
-                        except UnicodeDecodeError:
-                            continue
-                    
-                    if text is None:
-                        # اگر هیچ encoding‌ای کار نکرد، با ignore errors دیکد کن
-                        text = data.decode('utf-8', errors='ignore')
-                    
-                    # استخراج پروکسی‌ها
-                    proxies = []
-                    lines = text.split('\n')
-                    
-                    for line in lines:
-                        line = line.strip()
-                        if not line:
-                            continue
+        async with self.semaphore:  # محدود کردن کارهای همزمان
+            try:
+                await self.initialize_session()
+                
+                async with self.session.get(source_url, ssl=False) as response:
+                    if response.status == 200:
+                        # خواندن به صورت بایت و دیکد با مدیریت خطا
+                        data = await response.read()
                         
-                        normalized, proxy_type = self.normalize_proxy(line)
-                        if normalized and proxy_type:
-                            proxies.append({
-                                'proxy_address': normalized,
-                                'proxy_type': proxy_type
-                            })
-                    
-                    logger.info(f"از {source_url} دریافت شد: {len(proxies)} پروکسی")
-                    return proxies, len(proxies)
-                else:
-                    logger.warning(f"خطا در دریافت از {source_url}: کد وضعیت {response.status}")
-                    
-        except aiohttp.ClientError as e:
-            logger.error(f"خطای شبکه در دریافت از {source_url}: {str(e)[:100]}")
-        except Exception as e:
-            logger.error(f"خطای غیرمنتظره در دریافت از {source_url}: {str(e)[:100]}")
-        
-        return [], 0
+                        # تلاش برای دیکد با encoding‌های مختلف
+                        encodings = ['utf-8', 'latin-1', 'iso-8859-1', 'cp1252', 'ascii']
+                        text = None
+                        
+                        for encoding in encodings:
+                            try:
+                                text = data.decode(encoding)
+                                break
+                            except UnicodeDecodeError:
+                                continue
+                        
+                        if text is None:
+                            # اگر هیچ encoding‌ای کار نکرد، با ignore errors دیکد کن
+                            text = data.decode('utf-8', errors='ignore')
+                        
+                        # استخراج پروکسی‌ها
+                        proxies = []
+                        lines = text.split('\n')
+                        
+                        for line in lines:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            
+                            normalized, proxy_type = self.normalize_proxy(line)
+                            if normalized and proxy_type:
+                                proxies.append({
+                                    'proxy_address': normalized,
+                                    'proxy_type': proxy_type
+                                })
+                        
+                        logger.info(f"از {source_url} دریافت شد: {len(proxies)} پروکسی")
+                        return proxies, len(proxies)
+                    else:
+                        logger.warning(f"خطا در دریافت از {source_url}: کد وضعیت {response.status}")
+                        
+            except asiohttp.ClientError as e:
+                logger.error(f"خطای شبکه در دریافت از {source_url}: {str(e)[:100]}")
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout در دریافت از {source_url}")
+            except Exception as e:
+                logger.error(f"خطای غیرمنتظره در دریافت از {source_url}: {str(e)[:100]}")
+            
+            return [], 0
     
     async def fetch_all_sources(self, update_progress_callback=None):
         """دریافت پروکسی‌ها از تمام منابع"""
@@ -561,10 +571,22 @@ class ProxyFetcher:
                 found=0
             )
         
-        # دریافت منابع به صورت سریالی برای جلوگیری از overload
+        # دریافت منابع به صورت موازی با محدودیت
+        tasks = []
         for i, source in enumerate(PROXY_SOURCES):
+            task = asyncio.create_task(self.fetch_from_source(source))
+            tasks.append((i, source, task))
+        
+        # پردازش نتایج
+        for i, source, task in tasks:
             try:
-                proxies, count = await self.fetch_from_source(source)
+                # منتظر نتیجه با timeout
+                try:
+                    proxies, count = await asyncio.wait_for(task, timeout=PROXY_SOURCES_TIMEOUT + 5)
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout برای منبع {source}")
+                    continue
+                
                 if proxies:
                     all_proxies.extend(proxies)
                 
@@ -578,9 +600,6 @@ class ProxyFetcher:
                         total=total_sources,
                         found=len(all_proxies)
                     )
-                
-                # وقفه برای جلوگیری از rate limit و overload
-                await asyncio.sleep(2)
                 
             except Exception as e:
                 logger.error(f"خطا در پردازش منبع {source}: {e}")
@@ -596,7 +615,7 @@ class ProxyFetcher:
         logger.info(f"جمع‌آوری شد: {len(unique_proxies)} پروکسی منحصربه‌فرد")
         return list(unique_proxies.values())
     
-    async def fetch_proxies(self, max_proxies=500, update_progress_callback=None):
+    async def fetch_proxies(self, max_proxies=1000, update_progress_callback=None):
         """دریافت پروکسی‌ها از منابع آنلاین"""
         try:
             all_proxies = await self.fetch_all_sources(update_progress_callback)
@@ -615,7 +634,7 @@ class ProxyFetcher:
                 all_proxies = all_proxies[:max_proxies]
             
             # ذخیره در دیتابیس
-            new_count, duplicate_count = await save_proxies_to_db(all_proxies)
+            new_count, duplicate_count = await save_proxies_to_db(all_proxies, 'online')
             
             if update_progress_callback:
                 await update_progress_callback(
@@ -685,12 +704,13 @@ class ProxyFetcher:
         return saved_files
 
 # ============================
-# کلاس ارسال ویو تلگرام (کامل شده)
+# کلاس ارسال ویو تلگرام
 # ============================
 class TelegramViewSender:
     def __init__(self):
         self.ua = UserAgent()
         self.session_cache = {}
+        self.semaphore = asyncio.Semaphore(10)  # محدودیت اتصال همزمان
     
     async def get_session(self, proxy_url=None):
         """ایجاد یا بازیابی session با proxy"""
@@ -714,7 +734,7 @@ class TelegramViewSender:
         self.session_cache.clear()
     
     async def fetch_post_data(self, channel_username, post_id, proxy_url=None):
-        """دریافت اطلاعات پست تلگرام - کامل شده"""
+        """دریافت اطلاعات پست تلگرام"""
         try:
             session = await self.get_session(proxy_url)
             
@@ -751,24 +771,8 @@ class TelegramViewSender:
                         'post_id': post_id,
                         'data': extracted_data,
                         'cookies': response.cookies,
-                        'html': html_content[:500]  # فقط بخشی برای دیباگ
+                        'html': html_content[:500]
                     }
-                
-                # روش جایگزین: استفاده از API داخلی تلگرام
-                api_patterns = [
-                    r'https://t\.me/v/\?views=[^"]+',
-                    r'window\.Telegram\.WebView\.initParams\s*=\s*([^;]+)'
-                ]
-                
-                for pattern in api_patterns:
-                    match = re.search(pattern, html_content)
-                    if match:
-                        return {
-                            'channel_username': channel_username,
-                            'post_id': post_id,
-                            'api_data': match.group(1),
-                            'cookies': response.cookies
-                        }
                 
                 logger.warning(f"داده‌های پست یافت نشد: {channel_username}/{post_id}")
                 return None
@@ -778,81 +782,61 @@ class TelegramViewSender:
             return None
     
     async def send_single_view(self, post_data, proxy_url=None, proxy_id=None):
-        """ارسال یک ویو به پست - کامل شده"""
-        try:
-            session = await self.get_session(proxy_url)
-            
-            # روش 1: استفاده از endpoint استاندارد تلگرام
-            endpoints = [
-                f'https://t.me/v/?views={post_data.get("data", {}).get("view", "")}',
-                f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}?embed=1&mode=view',
-                f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}?view'
-            ]
-            
-            success = False
-            for endpoint in endpoints:
-                try:
-                    async with session.get(endpoint, allow_redirects=True) as response:
-                        if response.status == 200:
-                            response_text = await response.text()
-                            
-                            # بررسی موفقیت آمیز بودن
-                            if any(keyword in response_text.lower() for keyword in ['view', 'success', 'ok', '200']):
+        """ارسال یک ویو به پست"""
+        async with self.semaphore:  # محدود کردن درخواست‌های همزمان
+            try:
+                session = await self.get_session(proxy_url)
+                
+                # استفاده از endpoint استاندارد تلگرام
+                endpoints = [
+                    f'https://t.me/v/?views={post_data.get("data", {}).get("view", "")}',
+                    f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}?embed=1&mode=view',
+                    f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}?view'
+                ]
+                
+                success = False
+                for endpoint in endpoints:
+                    try:
+                        async with session.get(endpoint, allow_redirects=True) as response:
+                            if response.status == 200:
+                                response_text = await response.text()
+                                
+                                # بررسی موفقیت آمیز بودن
+                                if any(keyword in response_text.lower() for keyword in ['view', 'success', 'ok', '200']):
+                                    success = True
+                                    break
+                    except:
+                        continue
+                
+                # روش جایگزین با POST
+                if not success:
+                    try:
+                        post_url = f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}/view'
+                        async with session.post(post_url, data={'view': '1'}) as response:
+                            if response.status == 200:
                                 success = True
-                                break
-                except:
-                    continue
-            
-            # روش 2: روش جایگزین با POST
-            if not success:
-                try:
-                    post_url = f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}/view'
-                    async with session.post(post_url, data={'view': '1'}) as response:
-                        if response.status == 200:
-                            success = True
-                except:
-                    pass
-            
-            # روش 3: استفاده از referer و headers خاص
-            if not success:
-                try:
-                    headers = {
-                        'Referer': f'https://t.me/{post_data["channel_username"]}/{post_data["post_id"]}',
-                        'X-Requested-With': 'XMLHttpRequest',
-                        'Accept': 'application/json, text/javascript, */*; q=0.01'
-                    }
-                    
-                    async with session.get(
-                        'https://t.me/v/',
-                        params={'views': '1'},
-                        headers=headers
-                    ) as response:
-                        if response.status == 200:
-                            success = True
-                except:
-                    pass
-            
-            # لاگ کردن نتیجه
-            if success and proxy_id:
-                await update_proxy_usage(proxy_id, True)
-                logger.info(f"✅ ویو ارسال شد با پروکسی {proxy_id}")
-            elif proxy_id:
-                await update_proxy_usage(proxy_id, False)
-                logger.warning(f"❌ ارسال ویو ناموفق با پروکسی {proxy_id}")
-            
-            return success
-            
-        except Exception as e:
-            logger.error(f"خطا در ارسال ویو: {e}")
-            if proxy_id:
-                await update_proxy_usage(proxy_id, False)
-            return False
+                    except:
+                        pass
+                
+                # لاگ کردن نتیجه
+                if success and proxy_id:
+                    await update_proxy_usage(proxy_id, True)
+                elif proxy_id:
+                    await update_proxy_usage(proxy_id, False)
+                
+                return success
+                
+            except Exception as e:
+                logger.error(f"خطا در ارسال ویو: {e}")
+                if proxy_id:
+                    await update_proxy_usage(proxy_id, False)
+                return False
     
     async def send_bulk_views(self, channel_username, post_id, proxy_list, target_views, order_id, progress_callback=None):
-        """ارسال دسته‌ای ویو - کامل شده"""
+        """ارسال دسته‌ای ویو"""
         logger.info(f"شروع ارسال ویو برای {channel_username}/{post_id} - هدف: {target_views}")
         
-        # دریافت داده‌های پست (یک بار)
+        # دریافت داده‌های پست
         post_data = await self.fetch_post_data(channel_username, post_id)
         if not post_data:
             logger.error("داده‌های پست دریافت نشد")
@@ -862,50 +846,55 @@ class TelegramViewSender:
         completed_proxies = 0
         total_proxies = len(proxy_list)
         
-        # محدود کردن تعداد ویو برای هر پروکسی
+        # محاسبه تعداد ویو برای هر پروکسی
         views_per_proxy = min(MAX_VIEWS_PER_PROXY, max(1, target_views // max(1, len(proxy_list))))
         
+        # ایجاد وظایف برای ارسال موازی
+        tasks = []
         for proxy_info in proxy_list:
             if successful_views >= target_views:
                 break
             
-            proxy_id = proxy_info['proxy_id']
+            proxy_id = proxy_info['proxy_address']
             proxy_url = proxy_info['proxy_address']
             
-            # ارسال چند ویو با این پروکسی
-            proxy_success = 0
+            # ایجاد task برای این پروکسی
             for attempt in range(views_per_proxy):
                 if successful_views >= target_views:
                     break
                 
-                success = await self.send_single_view(post_data, proxy_url, proxy_id)
+                task = asyncio.create_task(self.send_single_view(post_data, proxy_url, None))
+                tasks.append((task, order_id, None))
+        
+        # اجرای وظایف و جمع‌آوری نتایج
+        for task, order_id, proxy_id in tasks:
+            try:
+                success = await task
                 
                 # لاگ کردن تلاش
                 await log_view_attempt(order_id, proxy_id, success)
                 
                 if success:
                     successful_views += 1
-                    proxy_success += 1
                     
                     # آپدیت سفارش
                     await update_view_order(order_id, successful_views, 'processing')
                     
                     # گزارش پیشرفت
                     if progress_callback and successful_views % 10 == 0:
+                        progress_percent = (successful_views / target_views * 100)
                         await progress_callback(
                             successful_views, 
                             target_views,
-                            completed_proxies + 1,
-                            total_proxies
+                            progress_percent
                         )
                 
                 # وقفه کوتاه بین ارسال‌ها
-                await asyncio.sleep(random.uniform(0.5, 1.5))
-            
-            completed_proxies += 1
-            
-            # گزارش پیشرفت برای پروکسی
-            logger.info(f"پروکسی {proxy_id}: {proxy_success}/{views_per_proxy} ویو موفق")
+                await asyncio.sleep(random.uniform(0.3, 1.0))
+                
+            except Exception as e:
+                logger.error(f"خطا در task ارسال ویو: {e}")
+                continue
         
         # آپدیت نهایی سفارش
         await update_view_order(order_id, successful_views, 'completed')
@@ -915,7 +904,7 @@ class TelegramViewSender:
     
     async def estimate_required_proxies(self, target_views):
         """تخمین تعداد پروکسی مورد نیاز"""
-        return min(100, max(10, target_views // MAX_VIEWS_PER_PROXY))
+        return min(50, max(5, target_views // MAX_VIEWS_PER_PROXY))
 
 # ============================
 # کلاس ربات تلگرام
@@ -971,18 +960,15 @@ class TelegramBot:
         url = f"{self.base_url}/sendDocument"
         
         try:
-            # بررسی وجود فایل
             if not os.path.exists(document_path):
                 raise FileNotFoundError(f"فایل {document_path} یافت نشد")
             
-            # ایجاد FormData
             data = aiohttp.FormData()
             data.add_field('chat_id', str(chat_id))
             
             if caption:
                 data.add_field('caption', caption)
             
-            # باز کردن فایل و اضافه کردن آن
             with open(document_path, 'rb') as file:
                 if not filename:
                     filename = os.path.basename(document_path)
@@ -1081,7 +1067,6 @@ class TelegramBot:
     async def download_file(self, file_id, file_path):
         """دانلود فایل از تلگرام"""
         try:
-            # دریافت اطلاعات فایل
             url = f"{self.base_url}/getFile"
             session = await self.get_session()
             
@@ -1091,13 +1076,11 @@ class TelegramBot:
                     if file_info.get('ok'):
                         file_path_tg = file_info['result']['file_path']
                         
-                        # دانلود فایل
                         download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path_tg}"
                         async with session.get(download_url) as download_response:
                             if download_response.status == 200:
                                 content = await download_response.read()
                                 
-                                # ذخیره فایل
                                 with open(file_path, 'wb') as f:
                                     f.write(content)
                                 
@@ -1149,6 +1132,7 @@ class ProxyManager:
     def __init__(self):
         self.fetcher = ProxyFetcher()
         self.view_sender = TelegramViewSender()
+        self.active_tasks = {}
     
     async def update_progress_in_telegram(self, bot, chat_id, message_id, **kwargs):
         """آپدیت پیشرفت در پیام تلگرام"""
@@ -1196,7 +1180,7 @@ class ProxyManager:
 └ کل پروکسی‌های یافت شده: {found}
 
 💾 پروکسی‌ها در دیتابیس ذخیره شدند.
-📁 در حال ایجاد فایل‌های خروجی...
+🎯 **اکنون می‌توانید از بخش «افزایش ویو تلگرام» استفاده کنید!**
 """
         else:
             text = f"""
@@ -1220,22 +1204,26 @@ class ProxyManager:
         bar = '█' * filled_length + '░' * (length - filled_length)
         return f"[{bar}]"
     
-    async def get_proxies_online(self, max_proxies=500, bot=None, chat_id=None, message_id=None):
+    async def get_proxies_online(self, max_proxies=1000, bot=None, chat_id=None, message_id=None):
         """دریافت پروکسی‌ها از منابع آنلاین"""
         async def update_callback(**kwargs):
             if bot and chat_id and message_id:
                 await self.update_progress_in_telegram(bot, chat_id, message_id, **kwargs)
         
-        proxies = await self.fetcher.fetch_proxies(
-            max_proxies=max_proxies,
-            update_progress_callback=update_callback
-        )
-        
-        saved_files = []
-        if proxies:
-            saved_files = await self.fetcher.save_proxies_to_files(proxies)
-        
-        return proxies, saved_files
+        try:
+            proxies = await self.fetcher.fetch_proxies(
+                max_proxies=max_proxies,
+                update_progress_callback=update_callback
+            )
+            
+            saved_files = []
+            if proxies:
+                saved_files = await self.fetcher.save_proxies_to_files(proxies)
+            
+            return proxies, saved_files
+        except Exception as e:
+            logger.error(f"خطا در get_proxies_online: {e}")
+            return [], []
     
     def categorize_proxies(self, proxies):
         """دسته‌بندی پروکسی‌ها بر اساس نوع"""
@@ -1259,12 +1247,12 @@ class ProxyManager:
         return categorized
     
     async def send_views(self, channel_username, post_id, target_views, order_id, progress_callback=None):
-        """ارسال ویو به پست تلگرام - کامل شده"""
+        """ارسال ویو به پست تلگرام"""
         # تخمین تعداد پروکسی مورد نیاز
         required_proxies = await self.view_sender.estimate_required_proxies(target_views)
         
         # دریافت پروکسی‌ها از دیتابیس
-        proxies = await get_proxies_for_view(required_proxies * 2)  # بیشتر بگیریم برای احتیاط
+        proxies = await get_proxies_for_view(required_proxies * 2)
         
         if not proxies:
             logger.error("هیچ پروکسی برای ارسال ویو موجود نیست")
@@ -1289,14 +1277,16 @@ class ProxyManager:
         await self.view_sender.close_all_sessions()
 
 # ============================
-# کلاس اصلی ربات (کامل شده)
+# کلاس اصلی ربات
 # ============================
 class BotHandler:
     def __init__(self):
         self.bot = TelegramBot()
         self.proxy_manager = ProxyManager()
-        self.user_states = {}  # برای ذخیره وضعیت کاربران
-        self.active_orders = {}  # برای پیگیری سفارشات فعال
+        self.user_states = {}
+        self.active_orders = {}
+        self.task_queue = asyncio.Queue()
+        self.task_workers = []
         logger.info("هندلر ربات راه‌اندازی شد")
     
     def create_keyboard(self, buttons, row_width=2):
@@ -1367,7 +1357,6 @@ class BotHandler:
 🔸 **برای شروع از دکمه‌های زیر استفاده کنید:**
 
 👨‍💻 **توسعه‌دهنده:** @Erfan138600
-📢 **کانال پشتیبانی:** در حال راه‌اندازی
 """
         
         await self.bot.send_message(
@@ -1394,11 +1383,34 @@ class BotHandler:
         try:
             await self.bot.send_chat_action(chat_id, "typing")
             
+            # اجرای عملیات در پس‌زمینه
+            asyncio.create_task(self._fetch_proxies_background(chat_id, progress_msg['message_id']))
+            
+        except Exception as e:
+            logger.error(f"خطا در شروع دریافت پروکسی: {e}")
+            error_text = f"""
+❌ **خطا در شروع عملیات!**
+
+⚠️ **خطا:** `{str(e)[:200]}`
+
+🔧 لطفاً دوباره تلاش کنید.
+"""
+            await self.bot.edit_message_text(
+                chat_id, 
+                progress_msg['message_id'], 
+                error_text, 
+                parse_mode='Markdown',
+                reply_markup=self.create_main_menu()
+            )
+    
+    async def _fetch_proxies_background(self, chat_id, message_id):
+        """دریافت پروکسی‌ها در پس‌زمینه"""
+        try:
             proxies, saved_files = await self.proxy_manager.get_proxies_online(
-                max_proxies=500,
+                max_proxies=1000,
                 bot=self.bot,
                 chat_id=chat_id,
-                message_id=progress_msg['message_id']
+                message_id=message_id
             )
             
             if not proxies:
@@ -1414,7 +1426,7 @@ class BotHandler:
 """
                 await self.bot.edit_message_text(
                     chat_id, 
-                    progress_msg['message_id'], 
+                    message_id, 
                     final_text, 
                     parse_mode='Markdown',
                     reply_markup=self.create_main_menu()
@@ -1423,7 +1435,16 @@ class BotHandler:
             
             categorized = self.proxy_manager.categorize_proxies(proxies)
             
-            # نمایش آمار نهایی
+            # دریافت آمار پروکسی‌ها
+            async with db_lock:
+                conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "online"')
+                online_proxies = cursor.fetchone()[0]
+                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "uploaded"')
+                uploaded_proxies = cursor.fetchone()[0]
+                conn.close()
+            
             stats_text = f"""
 ✅ **دریافت پروکسی‌ها با موفقیت کامل شد!**
 
@@ -1437,7 +1458,12 @@ class BotHandler:
 ├ SOCKS4: {len(categorized['socks4'])} پروکسی
 └ SOCKS5: {len(categorized['socks5'])} پروکسی
 
-📈 **مجموع: {len(proxies)} پروکسی منحصربه‌فرد**
+📈 **مجموع پروکسی‌های جدید: {len(proxies)} عدد**
+
+🔸 **کل پروکسی‌های موجود در دیتابیس:**
+├ پروکسی آنلاین: {online_proxies} عدد
+├ پروکسی آپلود شده: {uploaded_proxies} عدد
+└ مجموع: {online_proxies + uploaded_proxies} عدد
 
 💾 پروکسی‌ها در دیتابیس ذخیره شدند.
 🎯 **اکنون می‌توانید از بخش «افزایش ویو تلگرام» استفاده کنید!**
@@ -1451,36 +1477,32 @@ class BotHandler:
             
             await self.bot.edit_message_text(
                 chat_id, 
-                progress_msg['message_id'], 
+                message_id, 
                 stats_text, 
                 parse_mode='Markdown',
                 reply_markup=keyboard
             )
             
-            # ارسال فایل‌های ذخیره شده (اختیاری)
+            # ارسال فایل‌ها (اختیاری)
             if saved_files:
                 for file_path in saved_files:
                     if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                        await self.bot.send_chat_action(chat_id, "upload_document")
                         try:
+                            await self.bot.send_chat_action(chat_id, "upload_document")
                             await self.bot.send_document(
                                 chat_id, 
                                 file_path, 
                                 caption=f"📁 فایل پروکسی‌ها"
                             )
+                            await asyncio.sleep(1)
+                            os.remove(file_path)
                         except Exception as e:
                             logger.error(f"خطا در ارسال فایل: {e}")
-                        
-                        await asyncio.sleep(1)
-                        try:
-                            os.remove(file_path)
-                        except:
-                            pass
             
-            # پاکسازی فایل‌های قدیمی
             await self.cleanup_old_files("proxy_files")
             
         except Exception as e:
+            logger.error(f"خطا در پس‌زمینه دریافت پروکسی: {e}")
             error_text = f"""
 ❌ **خطا در دریافت پروکسی‌ها!**
 
@@ -1493,15 +1515,16 @@ class BotHandler:
                 ("🔙 منوی اصلی", "back_to_main")
             ])
             
-            await self.bot.edit_message_text(
-                chat_id, 
-                progress_msg['message_id'], 
-                error_text, 
-                parse_mode='Markdown',
-                reply_markup=keyboard
-            )
-            logger.error(f"خطا در handle_fetch_online_proxies: {e}")
-            logger.error(traceback.format_exc())
+            try:
+                await self.bot.edit_message_text(
+                    chat_id, 
+                    message_id, 
+                    error_text, 
+                    parse_mode='Markdown',
+                    reply_markup=keyboard
+                )
+            except:
+                pass
     
     async def handle_increase_views(self, chat_id, message_id, user_id):
         """منوی افزایش ویو"""
@@ -1682,10 +1705,6 @@ class BotHandler:
         if state['state'] != 'awaiting_post_link':
             return False
         
-        # استخراج اطلاعات از لینک
-        channel_username = None
-        post_id = None
-        
         try:
             # پاکسازی لینک
             text = text.strip()
@@ -1698,12 +1717,15 @@ class BotHandler:
             text = text.replace('www.', '')
             
             # استخراج اطلاعات
+            channel_username = None
+            post_id = None
+            
             if 't.me/' in text:
                 parts = text.split('t.me/')[1].split('/')
                 if len(parts) >= 1:
                     channel_username = parts[0].replace('@', '')
                 if len(parts) >= 2:
-                    post_id = parts[1].split('?')[0]  # حذف query parameters
+                    post_id = parts[1].split('?')[0]
             elif '/' in text:
                 parts = text.split('/')
                 if len(parts) >= 2:
@@ -1790,11 +1812,27 @@ class BotHandler:
             # ذخیره داده‌ها
             state['data']['view_count'] = view_count
             
+            # تعیین منبع پروکسی
+            async with db_lock:
+                conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "online"')
+                online_count = cursor.fetchone()[0]
+                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "uploaded"')
+                uploaded_count = cursor.fetchone()[0]
+                conn.close()
+            
+            proxy_source = 'mixed'
+            if online_count > uploaded_count * 2:
+                proxy_source = 'online'
+            elif uploaded_count > online_count * 2:
+                proxy_source = 'uploaded'
+            
             # ایجاد سفارش
             channel_username = state['data']['channel_username']
             post_id = state['data']['post_id']
             
-            order_id = await create_view_order(user_id, channel_username, post_id, view_count)
+            order_id = await create_view_order(user_id, channel_username, post_id, view_count, proxy_source)
             
             # پاکسازی وضعیت
             del self.user_states[user_id]
@@ -1808,6 +1846,7 @@ class BotHandler:
 ├ کانال: @{channel_username}
 ├ پست: {post_id}
 ├ تعداد ویو: {view_count:,}
+├ منبع پروکسی: {proxy_source}
 └ وضعیت: در انتظار شروع
 
 ⏳ **در حال شروع عملیات...**
@@ -1816,8 +1855,10 @@ class BotHandler:
             
             await self.bot.send_message(chat_id, confirm_text, parse_mode='Markdown')
             
-            # شروع عملیات افزایش ویو
-            await self.start_view_order(chat_id, order_id, user_id, channel_username, post_id, view_count)
+            # شروع عملیات افزایش ویو در پس‌زمینه
+            asyncio.create_task(
+                self.start_view_order(chat_id, order_id, user_id, channel_username, post_id, view_count)
+            )
             
             return True
             
@@ -1857,9 +1898,8 @@ class BotHandler:
         
         try:
             # آپدیت پیام پیشرفت
-            async def update_progress(current, total, proxies_done, proxies_total):
-                progress = (current / total * 100) if total > 0 else 0
-                progress_bar = self._create_progress_bar(progress)
+            async def update_progress(current, total, progress_percent):
+                progress_bar = self._create_progress_bar(progress_percent)
                 
                 text = f"""
 🔄 **در حال افزایش ویو...**
@@ -1868,11 +1908,10 @@ class BotHandler:
 ├ کانال: @{channel_username}
 ├ پست: {post_id}
 ├ هدف: {target_views:,} ویو
-├ تکمیل شده: {current:,} ویو ({progress:.1f}%)
-├ پروکسی‌ها: {proxies_done}/{proxies_total}
+├ تکمیل شده: {current:,} ویو ({progress_percent:.1f}%)
 └ وضعیت: در حال اجرا...
 
-{progress_bar} {progress:.1f}%
+{progress_bar} {progress_percent:.1f}%
 
 ⏳ لطفاً صبر کنید...
                 """
@@ -1941,7 +1980,6 @@ class BotHandler:
             """
             
             keyboard = self.create_keyboard([
-                ("🔄 تلاش مجدد", f"retry_order_{order_id}"),
                 ("📋 سفارشات من", "my_orders"),
                 ("🔙 منوی اصلی", "back_to_main")
             ])
@@ -2046,27 +2084,9 @@ class BotHandler:
         
         elif data == 'help':
             await self.show_help(chat_id, message_id)
-        
-        elif data.startswith('retry_order_'):
-            order_id = data.split('_')[2]
-            await self.bot.answer_callback_query(callback_query['id'], text="🔄 در حال تلاش مجدد...", show_alert=False)
-            
-            # دریافت اطلاعات سفارش
-            async with db_lock:
-                conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
-                cursor = conn.cursor()
-                cursor.execute('SELECT user_id, channel_username, post_id, target_views FROM view_orders WHERE order_id = ?', (order_id,))
-                order_info = cursor.fetchone()
-                conn.close()
-            
-            if order_info and order_info[0] == user_id:
-                user_id_db, channel_username, post_id, target_views = order_info
-                await self.start_view_order(chat_id, order_id, user_id, channel_username, post_id, target_views)
-            else:
-                await self.bot.answer_callback_query(callback_query['id'], text="❌ سفارش یافت نشد!", show_alert=True)
     
     async def handle_document(self, message):
-        """مدیریت دریافت فایل - کامل شده"""
+        """مدیریت دریافت فایل"""
         chat_id = message['chat']['id']
         user_id = message['from']['id']
         document = message.get('document', {})
@@ -2075,13 +2095,11 @@ class BotHandler:
             await self.bot.send_message(chat_id, "❌ لطفاً یک فایل ارسال کنید.")
             return
         
-        # بررسی حجم فایل
         file_size = document.get('file_size', 0)
         if file_size > MAX_FILE_SIZE:
             await self.bot.send_message(chat_id, f"❌ حجم فایل ({file_size/1024/1024:.1f} MB) بیشتر از 20 مگابایت است.")
             return
         
-        # بررسی فرمت فایل
         file_name = document.get('file_name', '').lower()
         if not (file_name.endswith('.txt') or file_name.endswith('.csv')):
             await self.bot.send_message(chat_id, "❌ فقط فایل‌های txt و csv پشتیبانی می‌شوند.")
@@ -2090,33 +2108,21 @@ class BotHandler:
         file_id = document['file_id']
         
         await self.bot.send_message(chat_id, "📥 در حال دانلود فایل...")
-        await self.bot.send_chat_action(chat_id, "typing")
         
-        # ایجاد نام فایل موقت
         temp_dir = "temp_files"
         await async_os.makedirs(temp_dir, exist_ok=True)
         temp_file = os.path.join(temp_dir, f"{file_id}_{file_name}")
         
-        # دانلود فایل
         if await self.bot.download_file(file_id, temp_file):
             await self.bot.send_message(chat_id, "✅ فایل با موفقیت دانلود شد. در حال پردازش...")
             
-            # پردازش فایل
-            await self.process_proxy_file(chat_id, temp_file, file_name, user_id)
-            
-            # حذف فایل موقت
-            try:
-                await async_os.remove(temp_file)
-            except:
-                pass
-            
-            # پاکسازی فایل‌های قدیمی
-            await self.cleanup_old_files(temp_dir, max_age_hours=1)
+            # پردازش فایل در پس‌زمینه
+            asyncio.create_task(self.process_proxy_file(chat_id, temp_file, file_name, user_id))
         else:
             await self.bot.send_message(chat_id, "❌ خطا در دانلود فایل. لطفاً دوباره تلاش کنید.")
     
     async def process_proxy_file(self, chat_id, file_path, original_filename, user_id):
-        """پردازش فایل پروکسی - کامل شده"""
+        """پردازش فایل پروکسی"""
         progress_msg = await self.bot.send_message(chat_id, "📊 در حال بررسی فایل...")
         
         try:
@@ -2124,9 +2130,7 @@ class BotHandler:
             line_count = 0
             valid_count = 0
             
-            # خواندن فایل با مدیریت encoding
             async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                # تخمین تعداد خطوط
                 content = await f.read()
                 lines = content.split('\n')
                 total_lines = len(lines)
@@ -2137,7 +2141,6 @@ class BotHandler:
                     parse_mode='Markdown'
                 )
                 
-                # پردازش خطوط
                 for i, line in enumerate(lines):
                     line = line.strip()
                     line_count += 1
@@ -2145,7 +2148,6 @@ class BotHandler:
                     if not line:
                         continue
                     
-                    # نرمال‌سازی پروکسی
                     normalized, proxy_type = ProxyFetcher().normalize_proxy(line)
                     if normalized and proxy_type:
                         proxies.append({
@@ -2154,7 +2156,6 @@ class BotHandler:
                         })
                         valid_count += 1
                     
-                    # گزارش پیشرفت هر 500 خط
                     if i % 500 == 0 and i > 0:
                         progress = (i / total_lines * 100)
                         await self.bot.edit_message_text(
@@ -2178,7 +2179,7 @@ class BotHandler:
                 return
             
             # ذخیره در دیتابیس
-            new_count, duplicate_count = await save_proxies_to_db(proxies)
+            new_count, duplicate_count = await save_proxies_to_db(proxies, 'uploaded')
             
             # آپدیت آمار کاربر
             async with db_lock:
@@ -2192,7 +2193,16 @@ class BotHandler:
                 conn.commit()
                 conn.close()
             
-            # ارسال نتایج
+            # دریافت آمار پروکسی‌ها
+            async with db_lock:
+                conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "online"')
+                online_proxies = cursor.fetchone()[0]
+                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "uploaded"')
+                uploaded_proxies = cursor.fetchone()[0]
+                conn.close()
+            
             result_text = f"""
 ✅ **پردازش فایل کامل شد!**
 
@@ -2201,6 +2211,11 @@ class BotHandler:
 ├ پروکسی‌های معتبر: {valid_count:,}
 ├ پروکسی‌های جدید: {new_count:,}
 └ پروکسی‌های تکراری: {duplicate_count:,}
+
+🔸 **کل پروکسی‌های موجود در دیتابیس:**
+├ پروکسی آنلاین: {online_proxies} عدد
+├ پروکسی آپلود شده: {uploaded_proxies} عدد
+└ مجموع: {online_proxies + uploaded_proxies} عدد
 
 💾 پروکسی‌ها در دیتابیس ذخیره شدند.
 🎯 **اکنون می‌توانید از بخش «افزایش ویو تلگرام» استفاده کنید!**
@@ -2218,9 +2233,16 @@ class BotHandler:
                 reply_markup=keyboard
             )
             
+            # حذف فایل موقت
+            try:
+                await async_os.remove(file_path)
+            except:
+                pass
+            
+            await self.cleanup_old_files("temp_files", max_age_hours=1)
+            
         except Exception as e:
             logger.error(f"خطا در پردازش فایل: {e}")
-            logger.error(traceback.format_exc())
             await self.bot.edit_message_text(
                 chat_id, progress_msg['message_id'],
                 f"❌ **خطا در پردازش فایل!**\n\n`{str(e)[:200]}`",
@@ -2229,12 +2251,11 @@ class BotHandler:
             )
     
     async def handle_text(self, message):
-        """مدیریت دریافت متن - کامل شده"""
+        """مدیریت دریافت متن"""
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
         user_id = message['from']['id']
         
-        # بررسی دستور cancel
         if text.lower() == '/cancel':
             if user_id in self.user_states:
                 del self.user_states[user_id]
@@ -2243,7 +2264,6 @@ class BotHandler:
                 await self.bot.send_message(chat_id, "ℹ️ هیچ عملیات فعالی برای لغو وجود ندارد.", reply_markup=self.create_main_menu())
             return
         
-        # بررسی وضعیت کاربر
         if user_id in self.user_states:
             state = self.user_states[user_id]
             
@@ -2259,7 +2279,6 @@ class BotHandler:
                 await self.process_broadcast_message(chat_id, user_id, text)
                 return
         
-        # بررسی دستورات
         if text.startswith('/'):
             if text == '/start':
                 await self.handle_start(chat_id, message['from'])
@@ -2286,7 +2305,6 @@ class BotHandler:
                     reply_markup=self.create_main_menu()
                 )
         
-        # بررسی لینک تلگرام
         elif ('t.me/' in text or text.startswith('@')) and user_id not in self.user_states:
             await self.bot.send_message(
                 chat_id,
@@ -2304,12 +2322,18 @@ class BotHandler:
             )
     
     async def show_stats(self, chat_id, message_id=None):
-        """نمایش آمار ربات - کامل شده"""
-        stats, total_proxies, unique_types, today_orders, today_completed = await get_stats()
+        """نمایش آمار ربات"""
+        stats, total_proxies, unique_types, today_orders, today_completed, proxy_sources = await get_stats()
         
         if stats:
             # محاسبه آمار اضافی
             success_rate = (stats[3] / max(1, stats[4]) * 100) if stats[4] > 0 else 0
+            
+            # تحلیل منابع پروکسی
+            source_analysis = ""
+            for source, count in proxy_sources:
+                percentage = (count / total_proxies * 100) if total_proxies > 0 else 0
+                source_analysis += f"├ {source}: {count:,} ({percentage:.1f}%)\n"
             
             text = f"""
 📊 **آمار کامل ربات**
@@ -2322,9 +2346,9 @@ class BotHandler:
 ├ پردازش شده: {stats[1]:,}
 ├ حذف شده (تکراری): {stats[2]:,}
 ├ موجود در دیتابیس: {total_proxies:,}
-└ انواع مختلف: {unique_types}
-
-🎯 **ویو‌ها:**
+├ انواع مختلف: {unique_types}
+└ **منابع پروکسی:**
+{source_analysis}🎯 **ویو‌ها:**
 ├ کل ویو ارسال شده: {stats[3]:,}
 ├ کل سفارشات: {stats[4]:,}
 ├ نرخ موفقیت: {success_rate:.1f}%
@@ -2358,7 +2382,7 @@ class BotHandler:
             )
     
     async def show_admin_panel(self, chat_id, message_id, user_id):
-        """نمایش پنل مدیریت - کامل شده"""
+        """نمایش پنل مدیریت"""
         if user_id not in ADMINS:
             await self.bot.edit_message_text(chat_id, message_id, "❌ دسترسی غیرمجاز!")
             return
@@ -2428,10 +2452,8 @@ class BotHandler:
         if user_id not in self.user_states or self.user_states[user_id]['state'] != 'awaiting_broadcast_message':
             return
         
-        # پاکسازی وضعیت
         del self.user_states[user_id]
         
-        # تایید پیام
         confirm_text = f"""
 ✅ **پیام همگانی دریافت شد!**
 
@@ -2468,7 +2490,6 @@ class BotHandler:
         )
         
         try:
-            # دریافت لیست کاربران
             async with db_lock:
                 conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
                 cursor = conn.cursor()
@@ -2480,7 +2501,6 @@ class BotHandler:
             success = 0
             failed = 0
             
-            # ارسال پیام به هر کاربر
             for i, user in enumerate(users):
                 try:
                     await self.bot.send_message(
@@ -2490,7 +2510,6 @@ class BotHandler:
                     )
                     success += 1
                     
-                    # گزارش پیشرفت هر 10 کاربر
                     if i % 10 == 0:
                         progress = (i / total_users * 100)
                         await self.bot.edit_message_text(
@@ -2504,14 +2523,12 @@ class BotHandler:
                             parse_mode='Markdown'
                         )
                     
-                    # وقفه برای جلوگیری از محدودیت تلگرام
                     await asyncio.sleep(0.1)
                     
                 except Exception as e:
                     failed += 1
                     logger.warning(f"خطا در ارسال به کاربر {user[0]}: {e}")
             
-            # نمایش نتیجه نهایی
             result_text = f"""
 ✅ **پیام همگانی ارسال شد!**
 
@@ -2546,7 +2563,7 @@ class BotHandler:
             )
     
     async def cleanup_database(self, chat_id, message_id):
-        """پاکسازی دیتابیس - کامل شده"""
+        """پاکسازی دیتابیس"""
         progress_msg = await self.bot.edit_message_text(
             chat_id, message_id,
             "🧹 **در حال پاکسازی دیتابیس...**\n\n"
@@ -2559,31 +2576,25 @@ class BotHandler:
                 conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
                 cursor = conn.cursor()
                 
-                # گرفتن آمار قبل از پاکسازی
                 cursor.execute('SELECT COUNT(*) FROM proxies')
                 before_proxies = cursor.fetchone()[0]
                 
                 cursor.execute('SELECT COUNT(*) FROM view_logs')
                 before_logs = cursor.fetchone()[0]
                 
-                # پاکسازی پروکسی‌های قدیمی (بیش از 7 روز)
                 cursor.execute('DELETE FROM proxies WHERE date(added_date) < date("now", "-7 days")')
                 deleted_proxies = cursor.rowcount
                 
-                # پاکسازی لاگ‌های قدیمی (بیش از 30 روز)
                 cursor.execute('DELETE FROM view_logs WHERE date(timestamp) < date("now", "-30 days")')
                 deleted_logs = cursor.rowcount
                 
-                # پاکسازی سفارشات قدیمی (بیش از 30 روز)
                 cursor.execute('DELETE FROM view_orders WHERE date(start_time) < date("now", "-30 days")')
                 deleted_orders = cursor.rowcount
                 
-                # بهینه‌سازی دیتابیس
                 cursor.execute('VACUUM')
                 
                 conn.commit()
                 
-                # گرفتن آمار بعد از پاکسازی
                 cursor.execute('SELECT COUNT(*) FROM proxies')
                 after_proxies = cursor.fetchone()[0]
                 
@@ -2655,7 +2666,7 @@ class BotHandler:
                 else:
                     text = f"👥 **آخرین {len(users)} کاربر:**\n\n"
                     
-                    for user in users[:10]:  # فقط 10 کاربر اول
+                    for user in users[:10]:
                         user_id, username, first_name, last_name, join_date, views_sent, last_active = user
                         
                         name = f"{first_name or ''} {last_name or ''}".strip() or "بدون نام"
@@ -2779,18 +2790,8 @@ class BotHandler:
                 for update in updates:
                     offset = update['update_id'] + 1
                     
-                    if 'message' in update:
-                        message = update['message']
-                        
-                        if 'document' in message:
-                            await self.handle_document(message)
-                        elif 'text' in message:
-                            await self.handle_text(message)
-                    
-                    elif 'callback_query' in update:
-                        callback_query = update['callback_query']
-                        message = callback_query.get('message', {})
-                        await self.handle_callback_query(callback_query, message)
+                    # پردازش هر آپدیت در یک تسک جداگانه برای جلوگیری از قفل شدن
+                    asyncio.create_task(self._process_single_update(update))
                 
                 await asyncio.sleep(0.1)
                 
@@ -2798,13 +2799,32 @@ class BotHandler:
                 logger.error(f"خطا در پردازش آپدیت: {e}")
                 logger.error(traceback.format_exc())
                 await asyncio.sleep(5)
+    
+    async def _process_single_update(self, update):
+        """پردازش یک آپدیت به صورت مجزا"""
+        try:
+            if 'message' in update:
+                message = update['message']
+                
+                if 'document' in message:
+                    await self.handle_document(message)
+                elif 'text' in message:
+                    await self.handle_text(message)
+            
+            elif 'callback_query' in update:
+                callback_query = update['callback_query']
+                message = callback_query.get('message', {})
+                await self.handle_callback_query(callback_query, message)
+                
+        except Exception as e:
+            logger.error(f"خطا در پردازش آپدیت منفرد: {e}")
+            logger.error(traceback.format_exc())
 
 # ============================
 # تابع اصلی
 # ============================
 async def main():
     """تابع اصلی اجرای ربات"""
-    # ایجاد دیتابیس
     init_db()
     
     # پاکسازی فایل‌های قدیمی در شروع
@@ -2831,6 +2851,7 @@ async def main():
     print("   🧹 پاکسازی و بهینه‌سازی دیتابیس")
     print("   📖 راهنمای کامل")
     print("   🔒 مدیریت وضعیت کاربران")
+    print("   ⚡ پردازش موازی و مدیریت همزمان درخواست‌ها")
     
     try:
         await handler.process_updates()
