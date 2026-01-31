@@ -548,7 +548,7 @@ class ProxyFetcher:
                     else:
                         logger.warning(f"خطا در دریافت از {source_url}: کد وضعیت {response.status}")
                         
-            except asiohttp.ClientError as e:
+            except aiohttp.ClientError as e:
                 logger.error(f"خطای شبکه در دریافت از {source_url}: {str(e)[:100]}")
             except asyncio.TimeoutError:
                 logger.error(f"Timeout در دریافت از {source_url}")
