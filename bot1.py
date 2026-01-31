@@ -37,7 +37,7 @@ TOKEN = '7880725906:AAHTNy_U8_MkX2tf3TVZl2z18kqUMf8AtAQ'
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
 ADMINS = [5914346958]
 REQUEST_TIMEOUT = 30
-PROXY_SOURCES_TIMEOUT = 20  # افزایش timeout برای منابع
+PROXY_SOURCES_TIMEOUT = 25  # افزایش timeout برای منابع
 MAX_VIEWS_PER_PROXY = 5  # حداکثر تعداد ویو برای هر پروکسی
 MAX_CONCURRENT_TASKS = 3  # کاهش وظایف همزمان برای جلوگیری از بن شدن
 
@@ -509,9 +509,9 @@ class ProxyFetcher:
                 await self.initialize_session()
                 
                 # تاخیر تصادفی برای جلوگیری از اسپم شدن درخواست‌ها
-                await asyncio.sleep(random.uniform(0.5, 2.0))
+                await asyncio.sleep(random.uniform(0.5, 1.5))
                 
-                async with self.session.get(source_url, ssl=False) as response:
+                async with self.session.get(source_url, ssl=False, timeout=aiohttp.ClientTimeout(total=15)) as response:
                     if response.status == 200:
                         # خواندن به صورت بایت و دیکد با مدیریت خطا
                         data = await response.read()
@@ -551,7 +551,7 @@ class ProxyFetcher:
                     else:
                         logger.warning(f"خطا در دریافت از {source_url}: کد وضعیت {response.status}")
                         
-            except aiohttp.ClientError as e:  # اصلاح شده
+            except aiohttp.ClientError as e:
                 logger.error(f"خطای شبکه در دریافت از {source_url}: {str(e)[:100]}")
             except asyncio.TimeoutError:
                 logger.error(f"Timeout در دریافت از {source_url}")
@@ -576,7 +576,7 @@ class ProxyFetcher:
         
         tasks = []
         for i, source in enumerate(PROXY_SOURCES):
-            await asyncio.sleep(random.uniform(0.1, 0.5))
+            await asyncio.sleep(random.uniform(0.1, 0.3))
             task = asyncio.create_task(self.fetch_from_source(source))
             tasks.append((i, source, task))
         
@@ -588,6 +588,14 @@ class ProxyFetcher:
                 except asyncio.TimeoutError:
                     logger.warning(f"Timeout برای منبع {source}")
                     completed += 1
+                    if update_progress_callback:
+                        await update_progress_callback(
+                            stage="دریافت از منابع",
+                            progress=int((completed / total_sources) * 100),
+                            current=completed,
+                            total=total_sources,
+                            found=len(all_proxies)
+                        )
                     continue
                 
                 if proxies:
@@ -636,30 +644,40 @@ class ProxyFetcher:
             if len(all_proxies) > max_proxies:
                 all_proxies = all_proxies[:max_proxies]
             
+            # ذخیره در دیتابیس
             new_count, duplicate_count = await save_proxies_to_db(all_proxies, 'online')
             
+            # همیشه پیام تکمیل را ارسال کن
             if update_progress_callback:
-                await update_progress_callback(
-                    stage="تکمیل",
-                    progress=100,
-                    current=len(all_proxies),
-                    total=len(all_proxies),
-                    found=len(all_proxies),
-                    new=new_count,
-                    duplicates=duplicate_count
-                )
+                try:
+                    await update_progress_callback(
+                        stage="تکمیل",
+                        progress=100,
+                        current=len(all_proxies),
+                        total=len(all_proxies),
+                        found=len(all_proxies),
+                        new=new_count,
+                        duplicates=duplicate_count
+                    )
+                except Exception as e:
+                    logger.error(f"خطا در ارسال پیام تکمیل: {e}")
             
             return all_proxies
             
         except Exception as e:
-            if update_progress_callback:
-                await update_progress_callback(
-                    stage="خطا",
-                    progress=0,
-                    error=str(e)[:200]
-                )
             logger.error(f"خطا در دریافت پروکسی‌ها: {e}")
             logger.error(traceback.format_exc())
+            
+            if update_progress_callback:
+                try:
+                    await update_progress_callback(
+                        stage="خطا",
+                        progress=0,
+                        error=str(e)[:200]
+                    )
+                except Exception as callback_error:
+                    logger.error(f"خطا در ارسال پیام خطا: {callback_error}")
+            
             return []
         finally:
             await self.close_session()
@@ -1127,16 +1145,17 @@ class ProxyManager:
         
         progress_bar = self._create_progress_bar(progress)
         
-        if error:
-            text = f"""
+        try:
+            if error:
+                text = f"""
 <b>❌ خطا در دریافت پروکسی‌ها</b>
 
 📝 خطا: <code>{error}</code>
 
 ⚠️ عملیات متوقف شد.
 """
-        elif stage == "دریافت از منابع":
-            text = f"""
+            elif stage == "دریافت از منابع":
+                text = f"""
 <b>🌐 در حال دریافت پروکسی‌ها از اینترنت...</b>
 
 📋 <b>مرحله:</b> {stage}
@@ -1148,8 +1167,8 @@ class ProxyManager:
 
 ⏳ لطفاً صبر کنید...
 """
-        elif stage == "تکمیل":
-            text = f"""
+            elif stage == "تکمیل":
+                text = f"""
 <b>✅ دریافت پروکسی‌ها با موفقیت کامل شد!</b>
 
 🎉 <b>عملیات با موفقیت به پایان رسید</b>
@@ -1162,8 +1181,8 @@ class ProxyManager:
 💾 پروکسی‌ها در دیتابیس ذخیره شدند.
 🎯 <b>اکنون می‌توانید از بخش «افزایش ویو تلگرام» استفاده کنید!</b>
 """
-        else:
-            text = f"""
+            else:
+                text = f"""
 <b>🔄 در حال پردازش...</b>
 
 📋 <b>مرحله:</b> {stage}
@@ -1172,11 +1191,29 @@ class ProxyManager:
 
 ⏳ لطفاً صبر کنید...
 """
-        
-        try:
+            
             await bot.edit_message_text(chat_id, message_id, text, parse_mode='HTML')
         except Exception as e:
             logger.error(f"خطا در آپدیت پیشرفت: {e}")
+            # تلاش مجدد
+            try:
+                if stage == "تکمیل":
+                    # اگر پیام تکمیل ارسال نشد، پیام جدید بفرست
+                    final_text = f"""
+<b>✅ دریافت پروکسی‌ها با موفقیت کامل شد!</b>
+
+🎉 <b>عملیات با موفقیت به پایان رسید</b>
+
+📊 <b>آمار:</b>
+├ پروکسی‌های جدید: {new}
+├ پروکسی‌های تکراری: {duplicates}
+└ کل پروکسی‌های یافت شده: {found}
+
+💾 پروکسی‌ها در دیتابیس ذخیره شدند.
+"""
+                    await bot.send_message(chat_id, final_text, parse_mode='HTML')
+            except Exception as send_error:
+                logger.error(f"خطا در ارسال پیام جایگزین: {send_error}")
     
     def _create_progress_bar(self, percentage, length=20):
         """ایجاد نوار پیشرفت"""
@@ -1188,7 +1225,10 @@ class ProxyManager:
         """دریافت پروکسی‌ها از منابع آنلاین"""
         async def update_callback(**kwargs):
             if bot and chat_id and message_id:
-                await self.update_progress_in_telegram(bot, chat_id, message_id, **kwargs)
+                try:
+                    await self.update_progress_in_telegram(bot, chat_id, message_id, **kwargs)
+                except Exception as e:
+                    logger.error(f"خطا در callback: {e}")
         
         try:
             proxies = await self.fetcher.fetch_proxies(
@@ -1389,38 +1429,20 @@ class BotHandler:
                 message_id=message_id
             )
             
-            if not proxies:
-                final_text = """
-<b>❌ دریافت پروکسی‌ها ناموفق بود!</b>
-
-⚠️ <b>خطا:</b> هیچ پروکسی‌ای یافت نشد!
-
-🔧 <b>راه‌حل‌های ممکن:</b>
-1️⃣ اتصال اینترنت خود را بررسی کنید
-2️⃣ بعداً دوباره تلاش کنید
-3️⃣ از فایل پروکسی آپلود شده استفاده کنید
-"""
-                await self.bot.edit_message_text(
-                    chat_id, 
-                    message_id, 
-                    final_text, 
-                    parse_mode='HTML',
-                    reply_markup=self.create_main_menu()
-                )
-                return
-            
-            categorized = self.proxy_manager.categorize_proxies(proxies)
-            
-            async with db_lock:
-                conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "online"')
-                online_proxies = cursor.fetchone()[0]
-                cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "uploaded"')
-                uploaded_proxies = cursor.fetchone()[0]
-                conn.close()
-            
-            stats_text = f"""
+            # همیشه پیام نهایی را نمایش بده
+            if proxies:
+                categorized = self.proxy_manager.categorize_proxies(proxies)
+                
+                async with db_lock:
+                    conn = sqlite3.connect('bot_stats.db', check_same_thread=False)
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "online"')
+                    online_proxies = cursor.fetchone()[0]
+                    cursor.execute('SELECT COUNT(*) FROM proxies WHERE source = "uploaded"')
+                    uploaded_proxies = cursor.fetchone()[0]
+                    conn.close()
+                
+                stats_text = f"""
 <b>✅ دریافت پروکسی‌ها با موفقیت کامل شد!</b>
 
 🎉 <b>عملیات با موفقیت به پایان رسید</b>
@@ -1443,37 +1465,75 @@ class BotHandler:
 💾 پروکسی‌ها در دیتابیس ذخیره شدند.
 🎯 <b>اکنون می‌توانید از بخش «افزایش ویو تلگرام» استفاده کنید!</b>
 """
-            
-            keyboard = self.create_keyboard([
-                ("📈 افزایش ویو", "increase_views"),
-                ("📊 آمار", "stats"),
-                ("🔙 منوی اصلی", "back_to_main")
-            ])
-            
-            await self.bot.edit_message_text(
-                chat_id, 
-                message_id, 
-                stats_text, 
-                parse_mode='HTML',
-                reply_markup=keyboard
-            )
-            
-            if saved_files:
-                for file_path in saved_files:
-                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
-                        try:
-                            await self.bot.send_chat_action(chat_id, "upload_document")
-                            await self.bot.send_document(
-                                chat_id, 
-                                file_path, 
-                                caption=f"📁 فایل پروکسی‌ها"
-                            )
-                            await asyncio.sleep(1)
-                            os.remove(file_path)
-                        except Exception as e:
-                            logger.error(f"خطا در ارسال فایل: {e}")
-            
-            await self.cleanup_old_files("proxy_files")
+                
+                keyboard = self.create_keyboard([
+                    ("📈 افزایش ویو", "increase_views"),
+                    ("📊 آمار", "stats"),
+                    ("🔙 منوی اصلی", "back_to_main")
+                ])
+                
+                # تلاش برای ویرایش پیام اصلی
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id, 
+                        message_id, 
+                        stats_text, 
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                except:
+                    # اگر ویرایش نشد، پیام جدید بفرست
+                    await self.bot.send_message(
+                        chat_id,
+                        stats_text,
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                
+                # ارسال فایل‌ها
+                if saved_files:
+                    for file_path in saved_files:
+                        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                            try:
+                                await self.bot.send_chat_action(chat_id, "upload_document")
+                                await self.bot.send_document(
+                                    chat_id, 
+                                    file_path, 
+                                    caption="📁 فایل پروکسی‌ها"
+                                )
+                                await asyncio.sleep(1)
+                                os.remove(file_path)
+                            except Exception as e:
+                                logger.error(f"خطا در ارسال فایل: {e}")
+                
+                await self.cleanup_old_files("proxy_files")
+            else:
+                # اگر پروکسی دریافت نشد
+                final_text = """
+<b>❌ دریافت پروکسی‌ها ناموفق بود!</b>
+
+⚠️ <b>خطا:</b> هیچ پروکسی‌ای یافت نشد!
+
+🔧 <b>راه‌حل‌های ممکن:</b>
+1️⃣ اتصال اینترنت خود را بررسی کنید
+2️⃣ بعداً دوباره تلاش کنید
+3️⃣ از فایل پروکسی آپلود شده استفاده کنید
+"""
+                try:
+                    await self.bot.edit_message_text(
+                        chat_id, 
+                        message_id, 
+                        final_text, 
+                        parse_mode='HTML',
+                        reply_markup=self.create_main_menu()
+                    )
+                except:
+                    await self.bot.send_message(
+                        chat_id,
+                        final_text,
+                        parse_mode='HTML',
+                        reply_markup=self.create_main_menu()
+                    )
             
         except Exception as e:
             logger.error(f"خطا در پس‌زمینه دریافت پروکسی: {e}")
@@ -1498,7 +1558,15 @@ class BotHandler:
                     reply_markup=keyboard
                 )
             except:
-                pass
+                try:
+                    await self.bot.send_message(
+                        chat_id,
+                        error_text,
+                        parse_mode='HTML',
+                        reply_markup=keyboard
+                    )
+                except:
+                    pass
     
     async def handle_increase_views(self, chat_id, message_id, user_id):
         """منوی افزایش ویو"""
@@ -2716,7 +2784,7 @@ class BotHandler:
             current_time = time.time()
             for filename in await async_os.listdir(directory):
                 file_path = os.path.join(directory, filename)
-                if await async_os.path.isfile(file_path):
+                if await async_os.isfile(file_path):
                     file_age = current_time - (await async_os.stat(file_path)).st_mtime
                     if file_age > max_age_hours * 3600:
                         await async_os.remove(file_path)
